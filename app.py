@@ -7,27 +7,31 @@ import math
 import logging
 from typing import Dict, Any, Optional, Tuple
 from threading import Lock
+
 # ======================================================
 # CONFIGURATION
 # ======================================================
 MIN_LIQ_USD = 3000
-CONF_INVEST = 85
+
+CONF_INVEST = 80
 CONF_BUY = 65
+
 CR_MAX = 60
-DECAY_DELTA = 12
+DECAY_CONF_DROP = 15
+DECAY_MC_DROP = 0.10      # 10% MC drop
 LIQ_VOL_MIN = 0.7
+
 LOW_MC_MIN = 20000
 LOW_MC_MAX = 50000
-STATE_SAVE_INTERVAL = 10 # seconds
-# Free safe additions
-MIN_LAUNCH_AGE_MIN = 3
-MAX_LAUNCH_AGE_MIN = 1440
-FDV_LIQ_MAX_RATIO = 50
-SCAN_WINDOW_SEC = 1800
-SCAN_THRESHOLD = 3
+
+INVEST_CONFIRM_GAP = 300   # seconds
+STATE_SAVE_INTERVAL = 15
+CACHE_TTL = 60
+
 STATE_FILE = "state.json"
 LOG_FILE = "app.log"
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens"
+
 # ======================================================
 # LOGGING
 # ======================================================
@@ -36,18 +40,30 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
+
 # ======================================================
-# THREAD-SAFE STATE
+# HELPERS
+# ======================================================
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+# ======================================================
+# STATE
 # ======================================================
 class TradingState:
     def __init__(self):
         self.lock = Lock()
         self.last_save = 0.0
+
         self.memory: Dict[str, Dict[str, Any]] = {}
         self.conf_history: Dict[str, list] = {}
-        self.market_regime = {"green": 0, "red": 0}
-        self.scan_activity: Dict[str, list] = {}
+        self.alpha_history: list = []   # (ts, alpha)
+
         self.load()
+
     def load(self):
         if not os.path.exists(STATE_FILE):
             return
@@ -56,10 +72,10 @@ class TradingState:
                 d = json.load(f)
                 self.memory = d.get("memory", {})
                 self.conf_history = d.get("conf_history", {})
-                self.market_regime = d.get("market_regime", self.market_regime)
-                self.scan_activity = d.get("scan_activity", {})
+                self.alpha_history = d.get("alpha_history", [])
         except Exception as e:
             logging.error(f"State load failed: {e}")
+
     def maybe_save(self):
         now = time.time()
         if now - self.last_save < STATE_SAVE_INTERVAL:
@@ -71,199 +87,171 @@ class TradingState:
                 json.dump({
                     "memory": self.memory,
                     "conf_history": self.conf_history,
-                    "market_regime": self.market_regime,
-                    "scan_activity": self.scan_activity
+                    "alpha_history": self.alpha_history
                 }, f)
             os.replace(tmp, STATE_FILE)
         except Exception as e:
             logging.error(f"State save failed: {e}")
+
 STATE = TradingState()
+
 # ======================================================
-# DATA ACCESS
+# CACHE
 # ======================================================
-def fetch_pair(ca: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+PAIR_CACHE = {}
+
+def cached_fetch_pair(ca: str):
+    now = time.time()
+    if ca in PAIR_CACHE:
+        pair, ts = PAIR_CACHE[ca]
+        if now - ts < CACHE_TTL:
+            return pair, None
+
     try:
         r = requests.get(f"{DEX_API}/{ca}", timeout=8)
         if r.status_code != 200:
             return None, "HTTP_ERROR"
+
         data = r.json()
         pairs = data.get("pairs", [])
         if not pairs:
             return None, "NO_MARKET"
-        return max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0)), None
+
+        best = max(pairs, key=lambda p: safe_float(p.get("liquidity", {}).get("usd")))
+        PAIR_CACHE[ca] = (best, now)
+        return best, None
     except Exception:
         return None, "FETCH_FAILED"
-def data_quality_ok(p: Dict[str, Any]) -> bool:
-    try:
-        return (
-            float(p.get("priceUsd", 0)) > 0 and
-            float(p.get("liquidity", {}).get("usd", 0)) >= MIN_LIQ_USD and
-            p.get("volume") and
-            p.get("txns")
-        )
-    except Exception:
-        return False
+
 # ======================================================
 # METRICS
 # ======================================================
-def normalized_alpha(v5: float, tx5: float) -> float:
+def normalized_alpha(v5, tx5):
     return math.log(v5 + 1) * 0.6 + math.log(tx5 + 1) * 0.4
-def time_weighted_confidence(history: list, current: float, window_min=30) -> float:
+
+def alpha_percentile(alpha, history):
+    recent = [a for t, a in history if time.time() - t <= 3600]
+    if len(recent) < 15:
+        return 50.0
+    below = sum(1 for v in recent if v <= alpha)
+    return round((below / len(recent)) * 100, 2)
+
+def time_weighted_confidence(hist):
+    if len(hist) < 2:
+        return hist[-1][1]
+    weights = []
+    values = []
     now = time.time()
-    window = window_min * 60
-    recent = [(t, c) for t, c in history if now - t <= window]
-    recent.append((now, current))
-    weights, values = [], []
-    for t, c in recent:
-        age = (now - t) / window
+    for t, c in hist[-6:]:
+        age = (now - t) / 1800
         w = math.exp(-3 * age)
         weights.append(w)
         values.append(c)
     return round(sum(w * v for w, v in zip(weights, values)) / sum(weights), 2)
-def behavioral_consistency_score(history: list) -> int:
-    if len(history) < 4:
-        return 0
-    values = [c for _, c in history[-6:]]
-    drops = sum(1 for i in range(1, len(values)) if values[i] < values[i-1])
-    score = 0
-    if drops >= 3:
-        score += 20
-    if max(values) - values[-1] > 15:
-        score += 20
-    return min(score, 40)
-def concentration_risk_score(
-    alpha_now: float,
-    alpha_prev: Optional[float],
-    conf_raw: float,
-    conf_tw: float,
-    liq: float,
-    vol: float,
-    decay_alert: bool,
-    low_mc: bool,
-    behavior_risk: int
-) -> int:
-    score = behavior_risk
-    if alpha_prev and alpha_prev > alpha_now:
-        score += 25
-    if conf_raw - conf_tw > DECAY_DELTA:
-        score += 15
-    if decay_alert:
-        score += 25
-    if liq / max(vol, 1) < LIQ_VOL_MIN:
-        score += 20
-    if low_mc:
-        score += 15
-    return min(score, 100)
-def concentration_label(score: int) -> str:
-    if score >= 80:
-        return "HIGH_CONCENTRATION"
-    if score >= 60:
-        return "ELEVATED_CONCENTRATION"
-    if score >= 30:
-        return "MODERATE_CONCENTRATION"
-    return "LOW_CONCENTRATION"
-# ======================================================
-# FREE SIGNALS
-# ======================================================
-def launch_sanity(pair: dict) -> Tuple[bool, str]:
-    created = pair.get("pairCreatedAt")
-    if not created:
-        return False, "UNKNOWN_AGE"
-    age_min = (time.time()*1000 - created) / 60000
-    liq = float(pair["liquidity"]["usd"])
-    fdv = float(pair.get("fdv", 0))
-    if age_min < MIN_LAUNCH_AGE_MIN:
-        return False, "TOO_EARLY"
-    if age_min > MAX_LAUNCH_AGE_MIN:
-        return False, "TOO_LATE"
-    if fdv > 0 and fdv / max(liq,1) > FDV_LIQ_MAX_RATIO:
-        return False, "FDV_LIQ_RISK"
-    return True, "OK"
-def social_velocity(ca: str) -> bool:
-    now = time.time()
-    scans = STATE.scan_activity.get(ca, [])
-    scans = [t for t in scans if now - t < SCAN_WINDOW_SEC]
-    scans.append(now)
-    STATE.scan_activity[ca] = scans
-    return len(scans) >= SCAN_THRESHOLD
-# ======================================================
-# PROJECTION
-# ======================================================
-def mc_projection(mc: float) -> dict:
-    return {
-        "15m": round(mc * 1.2, 2),
-        "1h": round(mc * 1.85, 2),
-        "6h": round(mc * 3.2, 2)
-    }
+
 # ======================================================
 # FLASK APP
 # ======================================================
 app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Trading engine live. Use /scan?ca=CONTRACT_ADDRESS"
+
 @app.route("/scan")
 def scan():
     ca = request.args.get("ca", "").strip()
     if len(ca) < 30:
-        return jsonify({"error": "Invalid contract"}), 400
-    pair, err = fetch_pair(ca)
-    if err or not pair or not data_quality_ok(pair):
-        return jsonify({"action": "WAIT", "reason": err or "BAD_DATA"})
-    ok, reason = launch_sanity(pair)
-    if not ok:
-        return jsonify({"action": "WAIT", "reason": reason})
-    v5 = float(pair["volume"]["m5"])
-    tx5 = sum(pair["txns"]["m5"].values())
-    liq = float(pair["liquidity"]["usd"])
-    fdv = float(pair.get("fdv", 0))
+        return jsonify({"action": "WAIT", "reason": "INVALID_CA"})
+
+    pair, err = cached_fetch_pair(ca)
+    if err or not pair:
+        return jsonify({"action": "WAIT", "reason": err})
+
+    v5 = safe_float(pair.get("volume", {}).get("m5"))
+    tx5 = safe_float(sum(pair.get("txns", {}).get("m5", {}).values()))
+    liq = safe_float(pair.get("liquidity", {}).get("usd"))
+    price_change = safe_float(pair.get("priceChange", {}).get("m5"))
+
+    if liq < MIN_LIQ_USD:
+        return jsonify({"action": "WAIT", "reason": "LOW_LIQUIDITY"})
+
+    fdv = safe_float(pair.get("fdv"))
     mc = fdv if fdv > 0 else liq * 2
     low_mc = LOW_MC_MIN <= mc <= LOW_MC_MAX
+
     alpha = normalized_alpha(v5, tx5)
-    raw_conf = min(100, alpha * 25)
+
     with STATE.lock:
+        STATE.alpha_history.append((time.time(), alpha))
+        STATE.alpha_history = [(t, a) for t, a in STATE.alpha_history if time.time() - t <= 3600]
+
+        raw_conf = alpha_percentile(alpha, STATE.alpha_history)
+
         hist = STATE.conf_history.get(ca, [])
         hist.append((time.time(), raw_conf))
-        STATE.conf_history[ca] = hist[-20:]
-        conf = time_weighted_confidence(hist, raw_conf)
-        decay_alert = any(c > conf + DECAY_DELTA for _, c in hist[-5:])
-        behavior_risk = behavioral_consistency_score(hist)
+        hist = hist[-10:]
+        STATE.conf_history[ca] = hist
+
+        conf = time_weighted_confidence(hist)
+
         prev = STATE.memory.get(ca, {})
-        alpha_prev = prev.get("alpha")
-        cr_score = concentration_risk_score(
-            alpha, alpha_prev, raw_conf, conf,
-            liq, v5, decay_alert, low_mc, behavior_risk
-        )
-        early_attention = social_velocity(ca)
+        prev_mc = prev.get("mc")
+        prev_conf = prev.get("conf")
+
+        decay_alert = False
+        if prev_mc and mc < prev_mc * (1 - DECAY_MC_DROP):
+            decay_alert = True
+        if prev_conf and prev_conf - conf >= DECAY_CONF_DROP:
+            decay_alert = True
+
+        concentration = 0
+        if price_change < -15:
+            concentration += 40
+        if liq / max(v5, 1) < LIQ_VOL_MIN:
+            concentration += 20
+        if low_mc:
+            concentration += 10
+
         action = "WAIT"
-        if conf >= CONF_INVEST and cr_score < CR_MAX and early_attention:
+
+        if not decay_alert and conf >= CONF_INVEST and concentration < CR_MAX and mc >= (prev_mc or mc):
             action = "INVEST"
-        elif conf >= CONF_BUY and not low_mc and cr_score < CR_MAX:
+        elif not decay_alert and conf >= CONF_BUY and concentration < CR_MAX and not low_mc:
             action = "BUY"
-        STATE.memory[ca] = {"alpha": alpha, "time": time.time()}
+
+        STATE.memory[ca] = {
+            "alpha": alpha,
+            "conf": conf,
+            "mc": mc,
+            "time": time.time()
+        }
+
         STATE.maybe_save()
+
     return jsonify({
         "action": action,
-        "market_cap": round(mc, 2),
-        "projection": mc_projection(mc),
-        "confidence_raw": round(raw_conf, 2),
-        "confidence_time_weighted": round(conf, 2),
+        "confidence_raw": raw_conf,
+        "confidence_time_weighted": conf,
         "alpha": round(alpha, 3),
+        "market_cap": round(mc, 2),
         "low_mc_mode": low_mc,
-        "concentration_score": cr_score,
-        "concentration_label": concentration_label(cr_score),
-        "behavior_risk": behavior_risk,
-        "early_attention": early_attention,
+        "concentration_score": concentration,
         "decay_alert": decay_alert,
         "entry_statement": (
-            "Sustained accumulation detected. Small asymmetric entry justified."
-            if action == "INVEST" else
-            "No entry recommended at this time."
+            "Early accumulation with MC stability."
+            if action == "INVEST"
+            else "Momentum trade only."
+            if action == "BUY"
+            else "No entry. Demand not confirmed."
         ),
         "exit_statement": (
-            "Reduce or exit if decay_alert turns true or concentration exceeds 60."
-            if action != "WAIT" else
-            "Stay sidelined and preserve capital."
+            "Exit immediately on MC drop or decay."
+            if action in ["INVEST", "BUY"]
+            else "Stay sidelined."
         )
     })
+
 if __name__ == "__main__":
     logging.info("Starting trading engine")
     app.run(host="0.0.0.0", port=5000)
-
