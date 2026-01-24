@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 import requests, time, os, json, math, logging
 from threading import Lock
 from typing import Dict, Any
@@ -125,23 +125,57 @@ def time_weighted_conf(hist):
     return round(sum(w * v for w, v in zip(weights, values)) / sum(weights), 2)
 
 # ======================================================
-# FLASK
+# FLASK APP
 # ======================================================
 app = Flask(__name__)
 
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meme Coin Scanner</title>
+<style>
+body { font-family: Arial; background:#0f172a; color:#e5e7eb; padding:16px; }
+.card { background:#111827; padding:16px; border-radius:12px; margin-bottom:16px; }
+input, button { width:100%; padding:12px; font-size:16px; margin-top:8px; }
+button { background:#2563eb; color:white; border:none; border-radius:8px; }
+pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="card">
+<h3>Paste Contract Address</h3>
+<input id="ca" placeholder="Paste CA here">
+<button onclick="scan()">Analyze</button>
+</div>
+<div class="card"><pre id="out"></pre></div>
+<script>
+async function scan(){
+  const ca = document.getElementById("ca").value;
+  if(!ca) return;
+  const r = await fetch("/scan?ca=" + ca);
+  const d = await r.json();
+  document.getElementById("out").textContent = JSON.stringify(d, null, 2);
+}
+</script>
+</body>
+</html>
+"""
+
 @app.route("/")
 def home():
-    return "Meme Scanner Live. Use /scan?ca=CONTRACT_ADDRESS"
+    return render_template_string(HTML_PAGE)
 
 @app.route("/scan")
 def scan():
     ca = request.args.get("ca", "").strip()
     if len(ca) < 30:
-        return jsonify({"action": "WAIT", "reason": "INVALID_CA"})
+        return jsonify({"action":"WAIT","reason":"INVALID_CA"})
 
     pair = fetch_pair(ca)
     if not pair:
-        return jsonify({"action": "WAIT", "reason": "DATA_UNAVAILABLE"})
+        return jsonify({"action":"WAIT","reason":"DATA_UNAVAILABLE"})
 
     token_name = pair.get("baseToken", {}).get("name", "Unknown")
     token_symbol = pair.get("baseToken", {}).get("symbol", "NA")
@@ -152,7 +186,7 @@ def scan():
     pc = safe_float(pair.get("priceChange", {}).get("m5"))
 
     if liq < MIN_LIQ_USD:
-        return jsonify({"action": "WAIT", "reason": "LOW_LIQUIDITY"})
+        return jsonify({"action":"WAIT","reason":"LOW_LIQUIDITY"})
 
     fdv = safe_float(pair.get("fdv"))
     mc = fdv if fdv > 0 else liq * 2
@@ -162,7 +196,7 @@ def scan():
 
     with STATE.lock:
         STATE.alpha_history.append((time.time(), alpha))
-        STATE.alpha_history = [(t, a) for t, a in STATE.alpha_history if time.time() - t <= 3600]
+        STATE.alpha_history = [(t,a) for t,a in STATE.alpha_history if time.time()-t <= 3600]
 
         raw_conf = alpha_percentile(alpha)
         hist = STATE.conf_history.get(ca, [])
@@ -179,29 +213,23 @@ def scan():
             decay = True
 
         concentration = 0
-        if pc < -15:
-            concentration += 40
-        if liq / max(v5, 1) < 0.7:
-            concentration += 20
-        if low_mc:
-            concentration += 10  # risk penalty, NOT a gate
+        if pc < -15: concentration += 40
+        if liq / max(v5,1) < 0.7: concentration += 20
+        if low_mc: concentration += 10
 
         action = "WAIT"
-        entry_statement = "No entry recommended."
-        exit_statement = "No position."
+        entry = "No entry recommended."
+        exit_s = "No position."
 
         if not decay and conf >= CONF_INVEST and concentration < CR_MAX and mc >= prev.get("mc", mc):
             action = "INVEST"
-            entry_statement = (
-                "Early accumulation detected. "
-                + ("Low market cap — very small size." if low_mc else "Market cap stable — cautious entry.")
-            )
-            exit_statement = "Exit immediately if market cap drops or confidence decays."
+            entry = "Early accumulation detected. Very small test position only."
+            exit_s = "Exit immediately if market cap drops or confidence decays."
 
         elif not decay and conf >= CONF_BUY and concentration < CR_MAX:
             action = "BUY"
-            entry_statement = "Momentum confirmed. Medium position allowed with tight risk."
-            exit_statement = "Exit if momentum stalls or decay alert appears."
+            entry = "Momentum confirmed. Medium position allowed."
+            exit_s = "Exit if momentum stalls or decay appears."
 
         STATE.memory[ca] = {"mc": mc, "conf": conf}
         STATE.save()
@@ -212,15 +240,14 @@ def scan():
         "action": action,
         "confidence_raw": raw_conf,
         "confidence_time_weighted": conf,
-        "alpha": round(alpha, 3),
-        "market_cap": round(mc, 2),
+        "alpha": round(alpha,3),
+        "market_cap": round(mc,2),
         "low_mc_mode": low_mc,
         "concentration_score": concentration,
         "decay_alert": decay,
-        "entry_statement": entry_statement,
-        "exit_statement": exit_statement
+        "entry_statement": entry,
+        "exit_statement": exit_s
     })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-    
