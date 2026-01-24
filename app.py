@@ -1,10 +1,5 @@
 from flask import Flask, request, jsonify
-import requests
-import time
-import os
-import json
-import math
-import logging
+import requests, time, os, json, math, logging
 from threading import Lock
 from typing import Dict, Any
 
@@ -29,9 +24,6 @@ STATE_SAVE_INTERVAL = 15
 STATE_FILE = "state.json"
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens"
 
-# ======================================================
-# LOGGING
-# ======================================================
 logging.basicConfig(level=logging.INFO)
 
 # ======================================================
@@ -137,60 +129,30 @@ def time_weighted_conf(hist):
 # ======================================================
 app = Flask(__name__)
 
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Meme Scanner</title>
-<style>
-body { font-family: Arial; background:#0f172a; color:#e5e7eb; padding:16px; }
-.card { background:#111827; padding:16px; border-radius:12px; margin-bottom:16px; }
-input, button { width:100%; padding:12px; font-size:16px; margin-top:8px; }
-button { background:#2563eb; color:white; border:none; border-radius:8px; }
-pre { white-space: pre-wrap; }
-</style>
-</head>
-<body>
-<div class="card">
-<h3>Paste Contract Address</h3>
-<input id="ca" placeholder="Paste CA">
-<button onclick="scan()">Analyze</button>
-</div>
-<div class="card"><pre id="out"></pre></div>
-<script>
-async function scan(){
-  let ca=document.getElementById("ca").value;
-  let r=await fetch("/scan?ca="+ca);
-  let d=await r.json();
-  document.getElementById("out").textContent=JSON.stringify(d,null,2);
-}
-</script>
-</body>
-</html>
-"""
-
 @app.route("/")
 def home():
-    return HTML
+    return "Meme Scanner Live. Use /scan?ca=CONTRACT_ADDRESS"
 
 @app.route("/scan")
 def scan():
-    ca = request.args.get("ca","").strip()
+    ca = request.args.get("ca", "").strip()
     if len(ca) < 30:
-        return jsonify({"action":"WAIT","reason":"INVALID_CA"})
+        return jsonify({"action": "WAIT", "reason": "INVALID_CA"})
 
     pair = fetch_pair(ca)
     if not pair:
-        return jsonify({"action":"WAIT","reason":"DATA_UNAVAILABLE"})
+        return jsonify({"action": "WAIT", "reason": "DATA_UNAVAILABLE"})
 
-    v5 = safe_float(pair.get("volume",{}).get("m5"))
-    tx5 = sum(pair.get("txns",{}).get("m5",{}).values())
-    liq = safe_float(pair.get("liquidity",{}).get("usd"))
-    pc = safe_float(pair.get("priceChange",{}).get("m5"))
+    token_name = pair.get("baseToken", {}).get("name", "Unknown")
+    token_symbol = pair.get("baseToken", {}).get("symbol", "NA")
+
+    v5 = safe_float(pair.get("volume", {}).get("m5"))
+    tx5 = sum(pair.get("txns", {}).get("m5", {}).values())
+    liq = safe_float(pair.get("liquidity", {}).get("usd"))
+    pc = safe_float(pair.get("priceChange", {}).get("m5"))
 
     if liq < MIN_LIQ_USD:
-        return jsonify({"action":"WAIT","reason":"LOW_LIQUIDITY"})
+        return jsonify({"action": "WAIT", "reason": "LOW_LIQUIDITY"})
 
     fdv = safe_float(pair.get("fdv"))
     mc = fdv if fdv > 0 else liq * 2
@@ -200,7 +162,7 @@ def scan():
 
     with STATE.lock:
         STATE.alpha_history.append((time.time(), alpha))
-        STATE.alpha_history = [(t,a) for t,a in STATE.alpha_history if time.time()-t<=3600]
+        STATE.alpha_history = [(t, a) for t, a in STATE.alpha_history if time.time() - t <= 3600]
 
         raw_conf = alpha_percentile(alpha)
         hist = STATE.conf_history.get(ca, [])
@@ -209,36 +171,54 @@ def scan():
         STATE.conf_history[ca] = hist
         conf = time_weighted_conf(hist)
 
-        prev = STATE.memory.get(ca,{})
+        prev = STATE.memory.get(ca, {})
         decay = False
-        if prev.get("mc") and mc < prev["mc"]*(1-DECAY_MC_DROP):
+        if prev.get("mc") and mc < prev["mc"] * (1 - DECAY_MC_DROP):
             decay = True
-        if prev.get("conf") and prev["conf"]-conf >= DECAY_CONF_DROP:
+        if prev.get("conf") and prev["conf"] - conf >= DECAY_CONF_DROP:
             decay = True
 
         concentration = 0
-        if pc < -15: concentration += 40
-        if liq/max(v5,1) < 0.7: concentration += 20
-        if low_mc: concentration += 10
+        if pc < -15:
+            concentration += 40
+        if liq / max(v5, 1) < 0.7:
+            concentration += 20
+        if low_mc:
+            concentration += 10  # risk penalty, NOT a gate
 
         action = "WAIT"
-        if not decay and conf >= CONF_INVEST and concentration < CR_MAX and mc >= prev.get("mc",mc):
-            action = "INVEST"
-        elif not decay and conf >= CONF_BUY and concentration < CR_MAX and not low_mc:
-            action = "BUY"
+        entry_statement = "No entry recommended."
+        exit_statement = "No position."
 
-        STATE.memory[ca] = {"mc":mc,"conf":conf}
+        if not decay and conf >= CONF_INVEST and concentration < CR_MAX and mc >= prev.get("mc", mc):
+            action = "INVEST"
+            entry_statement = (
+                "Early accumulation detected. "
+                + ("Low market cap — very small size." if low_mc else "Market cap stable — cautious entry.")
+            )
+            exit_statement = "Exit immediately if market cap drops or confidence decays."
+
+        elif not decay and conf >= CONF_BUY and concentration < CR_MAX:
+            action = "BUY"
+            entry_statement = "Momentum confirmed. Medium position allowed with tight risk."
+            exit_statement = "Exit if momentum stalls or decay alert appears."
+
+        STATE.memory[ca] = {"mc": mc, "conf": conf}
         STATE.save()
 
     return jsonify({
-        "action":action,
-        "confidence_raw":raw_conf,
-        "confidence_time_weighted":conf,
-        "alpha":round(alpha,3),
-        "market_cap":round(mc,2),
-        "low_mc_mode":low_mc,
-        "concentration_score":concentration,
-        "decay_alert":decay
+        "token_name": token_name,
+        "token_symbol": token_symbol,
+        "action": action,
+        "confidence_raw": raw_conf,
+        "confidence_time_weighted": conf,
+        "alpha": round(alpha, 3),
+        "market_cap": round(mc, 2),
+        "low_mc_mode": low_mc,
+        "concentration_score": concentration,
+        "decay_alert": decay,
+        "entry_statement": entry_statement,
+        "exit_statement": exit_statement
     })
 
 if __name__ == "__main__":
