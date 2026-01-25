@@ -11,18 +11,20 @@ MIN_LIQ_USD = 3000
 CONF_INVEST = 80
 CONF_BUY = 65
 
-LOW_MC_MIN = 20000
-LOW_MC_MAX = 50000
+LOW_MC_MIN = 15000
+LOW_MC_MAX = 80000
 
 DECAY_CONF_DROP = 15
-DECAY_MC_DROP = 0.10
+DECAY_MC_DROP = 0.12
 CR_MAX = 60
 
 CACHE_TTL = 120
-STATE_SAVE_INTERVAL = 15
+STATE_SAVE_INTERVAL = 20
 
 STATE_FILE = "state.json"
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens"
+
+AUTO_REFRESH_MINUTES = 5
 
 logging.basicConfig(level=logging.INFO)
 
@@ -129,64 +131,101 @@ def time_weighted_conf(hist):
 # ======================================================
 app = Flask(__name__)
 
-HTML_PAGE = """
+HTML = f"""
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Meme Coin Scanner</title>
+<title>Meme Scanner</title>
 <style>
-body { font-family: Arial; background:#0f172a; color:#e5e7eb; padding:16px; }
-.card { background:#111827; padding:16px; border-radius:12px; margin-bottom:16px; }
-input, button { width:100%; padding:12px; font-size:16px; margin-top:8px; }
-button { background:#2563eb; color:white; border:none; border-radius:8px; }
-pre { white-space: pre-wrap; }
+body {{ font-family: Arial; background:#0f172a; color:#e5e7eb; padding:16px }}
+.card {{ background:#111827; padding:16px; border-radius:12px; margin-bottom:16px; border:2px solid transparent }}
+.card.up {{ border-color:#16a34a }}
+.card.down {{ border-color:#dc2626 }}
+input,button {{ width:100%; padding:12px; font-size:16px; margin-top:8px }}
+button {{ background:#2563eb; color:white; border:none; border-radius:8px }}
+pre {{ white-space:pre-wrap }}
 </style>
 </head>
 <body>
+
 <div class="card">
-<h3>Paste Contract Address</h3>
-<input id="ca" placeholder="Paste CA here">
-<button onclick="scan()">Analyze</button>
+<h3>Paste Contract Addresses</h3>
+<input class="ca" placeholder="CA 1">
+<input class="ca" placeholder="CA 2">
+<input class="ca" placeholder="CA 3">
+<input class="ca" placeholder="CA 4">
+<input class="ca" placeholder="CA 5">
+<button onclick="scanAll()">Scan Now</button>
+<p>Auto refresh every {AUTO_REFRESH_MINUTES} minutes</p>
 </div>
-<div class="card"><pre id="out"></pre></div>
+
+<div id="results"></div>
+
 <script>
-async function scan(){
-  const ca = document.getElementById("ca").value;
-  if(!ca) return;
-  const r = await fetch("/scan?ca=" + ca);
-  const d = await r.json();
-  document.getElementById("out").textContent = JSON.stringify(d, null, 2);
-}
+let lastResults = {{}};
+
+async function scanAll() {{
+  const cas = [];
+  document.querySelectorAll(".ca").forEach(b => {{
+    if (b.value.trim()) cas.push(b.value.trim());
+  }});
+
+  if (cas.length === 0) return;
+
+  const r = await fetch("/scan_batch", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/json"}},
+    body: JSON.stringify({{cas}})
+  }});
+  const data = await r.json();
+
+  const results = document.getElementById("results");
+  results.innerHTML = "";
+
+  data.forEach(d => {{
+    const div = document.createElement("div");
+    div.className = "card";
+
+    if (d.status_changed) {{
+      if (["INVEST","BUY"].includes(d.action)) div.classList.add("up");
+      else div.classList.add("down");
+    }}
+
+    div.innerHTML = "<pre>"+JSON.stringify(d,null,2)+"</pre>";
+    results.appendChild(div);
+  }});
+}}
+
+setInterval(scanAll, {AUTO_REFRESH_MINUTES} * 60 * 1000);
 </script>
+
 </body>
 </html>
 """
 
 @app.route("/")
 def home():
-    return render_template_string(HTML_PAGE)
+    return render_template_string(HTML)
 
-@app.route("/scan")
-def scan():
-    ca = request.args.get("ca", "").strip()
-    if len(ca) < 30:
-        return jsonify({"action":"WAIT","reason":"INVALID_CA"})
-
+# ======================================================
+# CORE SCAN
+# ======================================================
+def scan_single(ca: str):
     pair = fetch_pair(ca)
     if not pair:
-        return jsonify({"action":"WAIT","reason":"DATA_UNAVAILABLE"})
+        return {"ca": ca, "action":"WAIT", "reason":"NO_MARKET_DATA"}
 
-    token_name = pair.get("baseToken", {}).get("name", "Unknown")
-    token_symbol = pair.get("baseToken", {}).get("symbol", "NA")
+    token_name = pair.get("baseToken",{}).get("name","Unknown")
+    token_symbol = pair.get("baseToken",{}).get("symbol","NA")
 
-    v5 = safe_float(pair.get("volume", {}).get("m5"))
-    tx5 = sum(pair.get("txns", {}).get("m5", {}).values())
-    liq = safe_float(pair.get("liquidity", {}).get("usd"))
-    pc = safe_float(pair.get("priceChange", {}).get("m5"))
+    v5 = safe_float(pair.get("volume",{}).get("m5"))
+    tx5 = sum(pair.get("txns",{}).get("m5",{}).values())
+    liq = safe_float(pair.get("liquidity",{}).get("usd"))
+    pc = safe_float(pair.get("priceChange",{}).get("m5"))
 
     if liq < MIN_LIQ_USD:
-        return jsonify({"action":"WAIT","reason":"LOW_LIQUIDITY"})
+        return {"ca": ca, "action":"WAIT", "reason":"LOW_LIQUIDITY"}
 
     fdv = safe_float(pair.get("fdv"))
     mc = fdv if fdv > 0 else liq * 2
@@ -195,21 +234,23 @@ def scan():
     alpha = alpha_score(v5, tx5)
 
     with STATE.lock:
-        STATE.alpha_history.append((time.time(), alpha))
+        STATE.alpha_history.append((time.time(),alpha))
         STATE.alpha_history = [(t,a) for t,a in STATE.alpha_history if time.time()-t <= 3600]
 
         raw_conf = alpha_percentile(alpha)
-        hist = STATE.conf_history.get(ca, [])
-        hist.append((time.time(), raw_conf))
+        hist = STATE.conf_history.get(ca,[])
+        hist.append((time.time(),raw_conf))
         hist = hist[-10:]
         STATE.conf_history[ca] = hist
         conf = time_weighted_conf(hist)
 
-        prev = STATE.memory.get(ca, {})
+        prev = STATE.memory.get(ca,{})
+        prev_action = prev.get("action")
+
         decay = False
-        if prev.get("mc") and mc < prev["mc"] * (1 - DECAY_MC_DROP):
+        if prev.get("mc") and mc < prev["mc"]*(1-DECAY_MC_DROP):
             decay = True
-        if prev.get("conf") and prev["conf"] - conf >= DECAY_CONF_DROP:
+        if prev.get("conf") and prev["conf"]-conf >= DECAY_CONF_DROP:
             decay = True
 
         concentration = 0
@@ -218,36 +259,37 @@ def scan():
         if low_mc: concentration += 10
 
         action = "WAIT"
-        entry = "No entry recommended."
-        exit_s = "No position."
-
-        if not decay and conf >= CONF_INVEST and concentration < CR_MAX and mc >= prev.get("mc", mc):
+        if not decay and conf >= CONF_INVEST and concentration < CR_MAX:
             action = "INVEST"
-            entry = "Early accumulation detected. Very small test position only."
-            exit_s = "Exit immediately if market cap drops or confidence decays."
-
         elif not decay and conf >= CONF_BUY and concentration < CR_MAX:
             action = "BUY"
-            entry = "Momentum confirmed. Medium position allowed."
-            exit_s = "Exit if momentum stalls or decay appears."
 
-        STATE.memory[ca] = {"mc": mc, "conf": conf}
+        status_changed = prev_action and prev_action != action
+
+        STATE.memory[ca] = {
+            "mc": mc,
+            "conf": conf,
+            "action": action
+        }
         STATE.save()
 
-    return jsonify({
-        "token_name": token_name,
-        "token_symbol": token_symbol,
+    return {
+        "ca": ca,
+        "token": f"{token_name} ({token_symbol})",
         "action": action,
-        "confidence_raw": raw_conf,
-        "confidence_time_weighted": conf,
-        "alpha": round(alpha,3),
+        "previous_action": prev_action,
+        "status_changed": status_changed,
+        "confidence_tw": conf,
         "market_cap": round(mc,2),
-        "low_mc_mode": low_mc,
-        "concentration_score": concentration,
-        "decay_alert": decay,
-        "entry_statement": entry,
-        "exit_statement": exit_s
-    })
+        "decay": decay
+    }
+
+@app.route("/scan_batch", methods=["POST"])
+def scan_batch():
+    cas = request.json.get("cas", [])
+    results = [scan_single(ca) for ca in cas]
+    return jsonify(results)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+                      
