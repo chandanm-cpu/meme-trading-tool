@@ -1,267 +1,167 @@
-from flask import Flask, request, jsonify, render_template_string
-import requests, time, math, json, os
-from threading import Lock
+import threading, time, requests, numpy as np, subprocess, json
+from flask import Flask, request, jsonify
 
-# ================= CONFIG =================
-DEX_API = "https://api.dexscreener.com/latest/dex/tokens"
-STATE_FILE = "oracle_state.json"
-
-CACHE_TTL = 90
-AUTO_REFRESH_MIN = 5
-
-MIN_LIQ = 2500
-LOW_MC_MAX = 80000
-
-# ================= UTIL =================
-def sf(x, d=0.0):
-    try:
-        return float(x)
-    except:
-        return d
-
-def pct(x, arr):
-    if len(arr) < 20:
-        return 50.0
-    return round(sum(1 for v in arr if v <= x) / len(arr) * 100, 2)
-
-# ================= STATE =================
-class OracleState:
-    def __init__(self):
-        self.lock = Lock()
-        self.alpha = []
-        self.vol_accel = []
-        self.social = []
-        self.load()
-
-    def load(self):
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE) as f:
-                    d = json.load(f)
-                    self.alpha = d.get("alpha", [])
-                    self.vol_accel = d.get("vol_accel", [])
-                    self.social = d.get("social", [])
-            except:
-                pass
-
-    def save(self):
-        with open(STATE_FILE, "w") as f:
-            json.dump({
-                "alpha": self.alpha[-2000:],
-                "vol_accel": self.vol_accel[-2000:],
-                "social": self.social[-2000:]
-            }, f)
-
-STATE = OracleState()
+app = Flask(__name__)
 CACHE = {}
+SCAN_INTERVAL = 60
 
-# ================= DATA =================
-def fetch_pair(ca):
-    now = time.time()
-    if ca in CACHE and now - CACHE[ca][1] < CACHE_TTL:
-        return CACHE[ca][0]
+# -----------------------------
+# Utils
+# -----------------------------
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
 
+# -----------------------------
+# LLM via Ollama (FREE)
+# -----------------------------
+def ollama_llm(data):
+    prompt = f"""
+You are a crypto market risk analyst.
+Do NOT predict prices.
+
+Analyze this token data and respond ONLY in JSON:
+{{"verdict":"ALLOW|CAUTION|BLOCK","confidence_adjustment":-0.3 to 0.1,"reason":"text"}}
+
+Data:
+{json.dumps(data)}
+"""
     try:
-        r = requests.get(f"{DEX_API}/{ca}", timeout=8)
-        if r.status_code != 200:
-            return None
-        pairs = r.json().get("pairs", [])
-        if not pairs:
-            return None
-        best = max(pairs, key=lambda p: sf(p.get("liquidity", {}).get("usd")))
-        CACHE[ca] = (best, now)
-        return best
-    except:
+        result = subprocess.run(
+            ["ollama", "run", "llama3", prompt],
+            capture_output=True, text=True, timeout=10
+        )
+        return json.loads(result.stdout.strip())
+    except Exception:
+        return {
+            "verdict": "CAUTION",
+            "confidence_adjustment": -0.05,
+            "reason": "LLM unavailable"
+        }
+
+# -----------------------------
+# Core Scoring (Research-Based)
+# -----------------------------
+def score_token(pair):
+    liq = pair.get("liquidity", {}).get("usd", 0)
+    fdv = pair.get("fdv", 0) or 0
+    vol5 = pair.get("volume", {}).get("m5", 0)
+    vol1h = pair.get("volume", {}).get("h1", 0)
+    pc5 = pair.get("priceChange", {}).get("m5", 0)
+
+    if liq < 5000:
         return None
 
-# ================= FEATURES =================
-def alpha(v, tx):
-    return math.log(v + 1) * 0.6 + math.log(tx + 1) * 0.4
+    vol_liq = vol5 / liq if liq else 0
+    fdv_liq = fdv / liq if liq else 0
 
-def volume_accel(v5, v30):
-    return v5 / max(v30, 1)
+    raw = (
+        np.log(liq + 1) * 0.30 +
+        vol_liq * 0.25 +
+        fdv_liq * 0.20 +
+        pc5 * 0.02
+    )
 
-def social_velocity(v5, tx5, liq):
-    s = 0
-    if v5 > 3000: s += 30
-    if tx5 > 15: s += 40
-    if liq > 0 and tx5 / liq > 0.002: s += 30
-    return min(s, 100)
+    p = sigmoid(raw - 4)
 
-# ================= REGIME =================
-def detect_regime(v5, v30, tx5, liq, mc, pc):
-    va = volume_accel(v5, v30)
-
-    if v5 < 1000 or tx5 < 5:
-        return "DEAD"
-
-    if tx5 > 40 and v5 < 3000:
-        return "CHAOTIC"
-
-    if va >= 1.8 and tx5 >= 10 and abs(pc) < 3 and mc < LOW_MC_MAX:
-        return "ACCUMULATION"
-
-    if va >= 2.5 and tx5 >= 20 and pc > 2:
-        return "IGNITION"
-
-    if pc > 8 and v5 > 10000:
-        return "EXPANSION"
-
-    if v5 > 15000 and tx5 < 15:
-        return "DISTRIBUTION"
-
-    return "UNKNOWN"
-
-def regime_score(r):
     return {
-        "ACCUMULATION": 70,
-        "IGNITION": 85,
-        "EXPANSION": 75
-    }.get(r, 0)
+        "p_10x": round(min(0.9, p), 2),
+        "p_20x": round(p * 0.55, 2),
+        "p_50x": round(p * 0.30, 2),
+        "p_100x": round(p * 0.12, 2),
+        "rug_risk": round(1 - p, 2),
+        "confidence": round(min(0.95, p + 0.15), 2),
+        "liquidity_usd": liq,
+        "fdv": fdv,
+        "volume_5m": vol5,
+        "volume_1h": vol1h
+    }
 
-# ================= FLASK =================
-app = Flask(__name__)
+# -----------------------------
+# DexScreener Scanner
+# -----------------------------
+def scan():
+    global CACHE
+    while True:
+        tmp = {"solana": {}, "bsc": {}}
+        for chain in ["solana", "bsc"]:
+            url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}"
+            pairs = requests.get(url, timeout=10).json().get("pairs", [])
 
-HTML = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Decision Oracle</title>
-<style>
-body {{ background:#0f172a;color:#e5e7eb;font-family:sans-serif;padding:16px }}
-.card {{ background:#111827;padding:16px;border-radius:12px;margin-bottom:12px }}
-table {{ width:100%;border-collapse:collapse }}
-th,td {{ padding:8px;border-bottom:1px solid #333 }}
-button,input {{ padding:10px;width:100%;margin-top:6px }}
-</style>
-</head>
-<body>
+            for p in pairs:
+                token = p.get("baseToken", {})
+                ca = token.get("address")
+                if not ca:
+                    continue
 
-<div class="card">
-<h3>Scan Contracts</h3>
-<input class="ca" placeholder="CA 1">
-<input class="ca" placeholder="CA 2">
-<input class="ca" placeholder="CA 3">
-<button onclick="scanAll()">Scan</button>
-<p>Auto refresh every {AUTO_REFRESH_MIN} minutes</p>
-</div>
+                score = score_token(p)
+                if not score:
+                    continue
 
-<div class="card">
-<h3>Ranking Board</h3>
-<table id="rank">
-<tr>
-<th>Rank</th>
-<th>Token</th>
-<th>Regime</th>
-<th>Conf</th>
-<th>Score</th>
-<th>Action</th>
-</tr>
-</table>
-</div>
+                llm = ollama_llm(score)
+                score["final_confidence"] = round(
+                    max(0, min(1, score["confidence"] + llm["confidence_adjustment"])), 2
+                )
 
-<script>
-async function scanAll() {{
-  let rows = [];
-  const boxes = document.querySelectorAll(".ca");
+                tmp[chain][ca] = {
+                    "name": token.get("name"),
+                    "symbol": token.get("symbol"),
+                    "chain": chain,
+                    "score": score,
+                    "llm_verdict": llm["verdict"],
+                    "llm_reason": llm["reason"]
+                }
 
-  for (let b of boxes) {{
-    if (!b.value) continue;
-    let r = await fetch("/scan?ca=" + b.value);
-    let d = await r.json();
-    if (d.score !== undefined) rows.push(d);
-  }}
+        CACHE = tmp
+        time.sleep(SCAN_INTERVAL)
 
-  rows.sort((a,b)=>b.score - a.score);
+threading.Thread(target=scan, daemon=True).start()
 
-  let t = document.getElementById("rank");
-  t.innerHTML = `
-    <tr>
-      <th>Rank</th>
-      <th>Token</th>
-      <th>Regime</th>
-      <th>Conf</th>
-      <th>Score</th>
-      <th>Action</th>
-    </tr>`;
+# -----------------------------
+# Monthly Backtest (Proxy)
+# -----------------------------
+def monthly_backtest(pair_address, chain):
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
+    r = requests.get(url, timeout=10).json().get("pair")
+    if not r:
+        return None
 
-  rows.forEach((r,i)=>{{
-    t.innerHTML += `<tr>
-      <td>${{i+1}}</td>
-      <td>${{r.token}}</td>
-      <td>${{r.regime}}</td>
-      <td>${{r.confidence}}</td>
-      <td>${{r.score}}</td>
-      <td>${{r.action}}</td>
-    </tr>`;
-  }});
-}}
+    pc24 = r.get("priceChange", {}).get("h24", 0)
+    return {
+        "24h_return_x": round(1 + pc24 / 100, 2),
+        "hit_2x": pc24 >= 100,
+        "hit_5x": pc24 >= 400,
+        "hit_10x": pc24 >= 900
+    }
 
-setInterval(scanAll, {AUTO_REFRESH_MIN} * 60000);
-</script>
-</body>
-</html>
-"""
+# -----------------------------
+# API
+# -----------------------------
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.json
+    chain = data["chain"]
+    out = {}
+
+    for ca in data["contracts"]:
+        token = CACHE.get(chain, {}).get(ca)
+        if not token:
+            out[ca] = {"signal": "LOW", "reason": "Not detected"}
+            continue
+
+        backtest = monthly_backtest(ca, chain)
+        out[ca] = {**token, "monthly_backtest": backtest}
+
+    return jsonify(out)
 
 @app.route("/")
-def home():
-    return render_template_string(HTML)
-
-@app.route("/scan")
-def scan():
-    ca = request.args.get("ca","").strip()
-    if len(ca) < 30:
-        return jsonify({"score": 0})
-
-    pair = fetch_pair(ca)
-    if not pair:
-        return jsonify({"score": 0})
-
-    v5 = sf(pair.get("volume",{}).get("m5"))
-    v30 = sf(pair.get("volume",{}).get("m30"))
-    tx5 = sum(pair.get("txns",{}).get("m5",{}).values())
-    liq = sf(pair.get("liquidity",{}).get("usd"))
-    fdv = sf(pair.get("fdv"))
-    mc = fdv if fdv > 0 else liq * 2
-    pc = sf(pair.get("priceChange",{}).get("m5"))
-
-    if liq < MIN_LIQ:
-        return jsonify({"score": 0})
-
-    a = alpha(v5, tx5)
-    va = volume_accel(v5, v30)
-    s = social_velocity(v5, tx5, liq)
-    reg = detect_regime(v5, v30, tx5, liq, mc, pc)
-
-    with STATE.lock:
-        STATE.alpha.append(a)
-        STATE.vol_accel.append(va)
-        STATE.social.append(s)
-
-        conf = round(
-            0.4 * pct(a, STATE.alpha) +
-            0.3 * pct(va, STATE.vol_accel) +
-            0.3 * pct(s, STATE.social),
-        2)
-
-        score = round(0.4 * regime_score(reg) + 0.6 * conf, 2)
-        STATE.save()
-
-    action = {
-        "ACCUMULATION": "OPTIONAL",
-        "IGNITION": "EARLY",
-        "EXPANSION": "MOMENTUM"
-    }.get(reg, "WAIT")
-
-    return jsonify({
-        "token": pair.get("baseToken",{}).get("name","Unknown"),
-        "regime": reg,
-        "confidence": conf,
-        "score": score,
-        "action": action
-    })
+def status():
+    return {
+        "status": "running",
+        "tracked": {
+            "solana": len(CACHE.get("solana", {})),
+            "bsc": len(CACHE.get("bsc", {}))
+        }
+    }
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-    
