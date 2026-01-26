@@ -8,22 +8,22 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# ==============================
-# GLOBAL STORES (STATE)
-# ==============================
-LIQ_HISTORY = {}        # ca -> previous liquidity
-RECENT_VOLUMES = []    # rolling volume window
-AUTO_REFRESH_INTERVAL = 60  # seconds
+# =====================================================
+# GLOBAL STATE
+# =====================================================
+LIQ_HISTORY = {}
+RECENT_VOLUMES = []
+AUTO_REFRESH_INTERVAL = 60
 
-# ==============================
+# =====================================================
 # UTILS
-# ==============================
+# =====================================================
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
-# ==============================
-# LIVE FETCH BY CA
-# ==============================
+# =====================================================
+# LIVE FETCH
+# =====================================================
 def fetch_pair_by_ca(ca):
     url = f"https://api.dexscreener.com/latest/dex/search/?q={ca}"
     try:
@@ -36,9 +36,43 @@ def fetch_pair_by_ca(ca):
     except Exception:
         return None
 
-# ==============================
+# =====================================================
+# DUMP / DISTRIBUTION GUARD (CRITICAL)
+# =====================================================
+def exhaustion_by_price(pair):
+    pc5 = pair.get("priceChange", {}).get("m5", 0)
+    pc1h = pair.get("priceChange", {}).get("h1", 0)
+
+    if pc1h > 20 and pc5 < -3:
+        return True
+
+    if pc5 < -8:
+        return True
+
+    return False
+
+def volume_decay(vol5, vol1h):
+    if vol1h == 0:
+        return True
+    if (vol5 / vol1h) < 0.08:
+        return True
+    return False
+
+def dump_guard(pair):
+    if exhaustion_by_price(pair):
+        return True
+
+    vol5 = pair.get("volume", {}).get("m5", 0)
+    vol1h = pair.get("volume", {}).get("h1", 0)
+
+    if volume_decay(vol5, vol1h):
+        return True
+
+    return False
+
+# =====================================================
 # LIQUIDITY STABILITY
-# ==============================
+# =====================================================
 def liquidity_stability(ca, current_liq):
     prev = LIQ_HISTORY.get(ca)
     LIQ_HISTORY[ca] = current_liq
@@ -46,8 +80,7 @@ def liquidity_stability(ca, current_liq):
     if not prev or prev == 0:
         return {"delta": 0, "status": "NEW"}
 
-    delta = (current_liq - prev) / prev
-    delta = round(delta, 2)
+    delta = round((current_liq - prev) / prev, 2)
 
     if delta < -0.10:
         return {"delta": delta, "status": "DRAINING"}
@@ -56,17 +89,17 @@ def liquidity_stability(ca, current_liq):
     else:
         return {"delta": delta, "status": "STABLE"}
 
-# ==============================
+# =====================================================
 # HOLDER VELOCITY (PROXY)
-# ==============================
+# =====================================================
 def holder_velocity(vol5, vol1h):
     if vol5 == 0:
         return 0
     return round(vol1h / vol5, 2)
 
-# ==============================
+# =====================================================
 # CAPITAL ROTATION
-# ==============================
+# =====================================================
 def capital_rotation(vol1h):
     RECENT_VOLUMES.append(vol1h)
     if len(RECENT_VOLUMES) > 50:
@@ -88,9 +121,9 @@ def capital_rotation(vol1h):
     else:
         return {"score": score, "status": "NEUTRAL"}
 
-# ==============================
+# =====================================================
 # CORE SCORING
-# ==============================
+# =====================================================
 def score_pair(pair):
     liquidity = pair.get("liquidity", {}).get("usd", 0)
     fdv = pair.get("fdv", 0) or 0
@@ -114,40 +147,18 @@ def score_pair(pair):
     p = sigmoid(raw - 4)
 
     return {
-        "p_10x": round(min(0.9, p), 2),
-        "p_20x": round(p * 0.55, 2),
-        "p_50x": round(p * 0.30, 2),
-        "p_100x": round(p * 0.12, 2),
+        "p10x": round(min(0.9, p), 2),
+        "p20x": round(p * 0.55, 2),
+        "p50x": round(p * 0.30, 2),
+        "p100x": round(p * 0.12, 2),
         "confidence": round(min(0.95, p + 0.15), 2),
-        "liquidity_usd": round(liquidity, 2),
+        "liquidity": round(liquidity, 2),
         "market_cap": round(fdv, 2)
     }
 
-# ==============================
-# LLM INTERPRETATION (SAFE)
-# ==============================
-def llm_interpretation(data):
-    try:
-        prompt = f"""
-Return JSON only:
-{{"verdict":"ALLOW|CAUTION|BLOCK","adjust":-0.3 to 0.1}}
-
-Data:
-{json.dumps(data)}
-"""
-        r = subprocess.run(
-            ["ollama", "run", "llama3", prompt],
-            capture_output=True,
-            text=True,
-            timeout=8
-        )
-        return json.loads(r.stdout.strip())
-    except Exception:
-        return {"verdict": "CAUTION", "adjust": -0.05}
-
-# ==============================
-# ANALYSIS LOGIC
-# ==============================
+# =====================================================
+# ANALYSIS LOGIC (WITH DUMP BLOCK)
+# =====================================================
 def analyze_contracts(chain, contracts):
     results = {}
 
@@ -157,74 +168,74 @@ def analyze_contracts(chain, contracts):
             results[ca] = {"signal": "LOW", "reason": "Pair not indexed yet"}
             continue
 
+        if dump_guard(pair):
+            results[ca] = {
+                "signal": "BLOCK",
+                "reason": "Distribution / dump detected"
+            }
+            continue
+
         score = score_pair(pair)
         if not score:
             results[ca] = {"signal": "LOW", "reason": "Liquidity too low"}
             continue
 
-        liq_status = liquidity_stability(ca, score["liquidity_usd"])
+        liq = liquidity_stability(ca, score["liquidity"])
         hv = holder_velocity(
             pair.get("volume", {}).get("m5", 0),
             pair.get("volume", {}).get("h1", 0)
         )
         rotation = capital_rotation(pair.get("volume", {}).get("h1", 0))
-        llm = llm_interpretation(score)
 
-        final_conf = round(
-            max(0, min(1, score["confidence"] + llm["adjust"])), 2
-        )
+        final_conf = score["confidence"]
 
         signal = "ALLOW"
         if (
-            liq_status["status"] == "GROWING" and
+            liq["status"] == "GROWING" and
             hv >= 2 and
             rotation["status"] == "INFLOW" and
-            score["p_10x"] >= 0.75 and
-            final_conf >= 0.85 and
-            llm["verdict"] == "ALLOW"
+            score["p10x"] >= 0.75 and
+            final_conf >= 0.85
         ):
             signal = "STRONG ALLOW"
 
+        token = pair.get("baseToken", {})
+
         results[ca] = {
-            "name": pair.get("baseToken", {}).get("name"),
-            "symbol": pair.get("baseToken", {}).get("symbol"),
+            "name": token.get("name"),
+            "symbol": token.get("symbol"),
             "market_cap": score["market_cap"],
             "signal": signal,
-            "liquidity_status": liq_status,
+            "liquidity_status": liq,
             "holder_velocity": hv,
             "capital_rotation": rotation,
-            "probabilities": {
-                "p10x": score["p_10x"],
-                "p20x": score["p_20x"],
-                "p50x": score["p_50x"],
-                "p100x": score["p_100x"],
-                "final_confidence": final_conf
-            }
+            "probabilities": score
         }
 
     return results
 
-# ==============================
+# =====================================================
 # API
-# ==============================
+# =====================================================
 @app.route("/analyze", methods=["POST"])
 def analyze():
     if not request.is_json:
         return jsonify({"error": "JSON only"}), 415
+
     data = request.get_json()
     return jsonify(analyze_contracts(
         data.get("chain"),
         data.get("contracts", [])
     ))
 
-# ==============================
+# =====================================================
 # UI
-# ==============================
+# =====================================================
 HTML_UI = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>Crypto Early Detector</title>
+<title>Dump-Safe Coin Detector</title>
 <style>
 body{background:#111;color:#eee;font-family:Arial;padding:15px}
 textarea{width:100%;height:160px;background:#222;color:#0f0}
@@ -235,7 +246,7 @@ th{background:#222}
 </style>
 </head>
 <body>
-<h2>🚀 Early Coin Detector</h2>
+<h2>🛡️ Dump-Safe Early Coin Detector</h2>
 <form method="post">
 <select name="chain">
 <option value="solana">Solana</option>
@@ -254,44 +265,4 @@ th{background:#222}
 <tr>
 <td>{{ r.name }}<br><small>{{ ca }}</small></td>
 <td>{{ r.signal }}</td>
-<td>{{ r.market_cap }}</td>
-<td>{{ r.probabilities.p10x }}</td>
-<td>{{ r.probabilities.p20x }}</td>
-<td>{{ r.probabilities.p50x }}</td>
-<td>{{ r.probabilities.p100x }}</td>
-</tr>
-{% endfor %}
-</table>
-{% endif %}
-</body>
-</html>
-"""
-
-@app.route("/ui", methods=["GET", "POST"])
-def ui():
-    results = None
-    if request.method == "POST":
-        cas = [
-            c.strip()
-            for c in request.form.get("contracts", "").splitlines()
-            if c.strip()
-        ]
-        chain = request.form.get("chain")
-        results = analyze_contracts(chain, cas)
-    return render_template_string(HTML_UI, results=results)
-
-# ==============================
-# AUTO REFRESH (BACKGROUND)
-# ==============================
-def auto_refresh():
-    while True:
-        time.sleep(AUTO_REFRESH_INTERVAL)
-
-threading.Thread(target=auto_refresh, daemon=True).start()
-
-@app.route("/")
-def home():
-    return {"status": "running", "mode": "LIVE + AUTO REFRESH"}
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+<td
