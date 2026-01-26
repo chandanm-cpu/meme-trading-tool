@@ -7,35 +7,34 @@ from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
 
 # =====================================================
-# Utils
+# Utilities
 # =====================================================
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
 # =====================================================
-# LIVE FETCH BY CA (CRITICAL FIX)
+# LIVE FETCH BY CONTRACT ADDRESS (CRITICAL)
 # =====================================================
 def fetch_pair_by_ca(ca):
     """
-    Fetch token pair LIVE using CA.
-    Works for very new coins once a pair exists.
+    Fetches pair data LIVE from DexScreener using CA.
+    Works for very new tokens once LP exists.
     """
     url = f"https://api.dexscreener.com/latest/dex/search/?q={ca}"
     try:
-        r = requests.get(url, timeout=10).json()
-        pairs = r.get("pairs", [])
-        for p in pairs:
-            base = p.get("baseToken", {})
+        data = requests.get(url, timeout=10).json()
+        for pair in data.get("pairs", []):
+            base = pair.get("baseToken", {})
             if base.get("address", "").lower() == ca.lower():
-                return p
+                return pair
         return None
     except Exception:
         return None
 
 
 # =====================================================
-# Core Scoring Engine (Research-Aligned)
+# CORE SCORING ENGINE (RESEARCH-ALIGNED)
 # =====================================================
 def score_pair(pair):
     liquidity = pair.get("liquidity", {}).get("usd", 0)
@@ -44,6 +43,7 @@ def score_pair(pair):
     vol1h = pair.get("volume", {}).get("h1", 0)
     pc5 = pair.get("priceChange", {}).get("m5", 0)
 
+    # Hard safety filter
     if liquidity < 3000:
         return None
 
@@ -75,18 +75,19 @@ def score_pair(pair):
 
 
 # =====================================================
-# LLM INTERPRETATION (OPTIONAL, SAFE FALLBACK)
+# LLM INTERPRETATION (OPTIONAL – SAFE FALLBACK)
 # =====================================================
 def llm_interpretation(data):
     """
-    If Ollama is not installed, this safely falls back.
+    Uses Ollama if available.
+    Falls back safely if not installed.
     """
     prompt = f"""
 You are a crypto risk analyst.
 Do NOT predict prices.
 
-Return JSON only:
-{{"verdict":"ALLOW|CAUTION|BLOCK","confidence_adjustment":-0.3 to 0.1,"reason":"text"}}
+Return ONLY JSON:
+{{"verdict":"ALLOW|CAUTION|BLOCK","confidence_adjustment":-0.3 to 0.1,"reason":"short"}}
 
 Data:
 {json.dumps(data)}
@@ -103,19 +104,14 @@ Data:
         return {
             "verdict": "CAUTION",
             "confidence_adjustment": -0.05,
-            "reason": "LLM not available"
+            "reason": "LLM unavailable"
         }
 
 
 # =====================================================
-# API: ANALYZE (LIVE, NO CACHE)
+# SHARED ANALYSIS LOGIC (API + UI USE THIS)
 # =====================================================
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    data = request.json
-    chain = data.get("chain")
-    contracts = data.get("contracts", [])
-
+def analyze_contracts(chain, contracts):
     results = {}
 
     for ca in contracts:
@@ -154,11 +150,26 @@ def analyze():
             "note": "Live fetched"
         }
 
-    return jsonify(results)
+    return results
 
 
 # =====================================================
-# SIMPLE UI (MOBILE FRIENDLY)
+# JSON API (POST)
+# =====================================================
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    if not request.is_json:
+        return jsonify({"error": "Content-Type must be application/json"}), 415
+
+    data = request.get_json()
+    chain = data.get("chain")
+    contracts = data.get("contracts", [])
+
+    return jsonify(analyze_contracts(chain, contracts))
+
+
+# =====================================================
+# SIMPLE MOBILE-FRIENDLY UI
 # =====================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -184,8 +195,8 @@ th { background:#222; }
 <option value="bsc">BSC</option>
 </select>
 
-<textarea name="contracts" placeholder="Paste contract addresses, one per line"></textarea>
-<button type="submit">Analyze (Live)</button>
+<textarea name="contracts" placeholder="Paste contract addresses (one per line)"></textarea>
+<button type="submit">Analyze</button>
 </form>
 
 {% if results %}
@@ -220,11 +231,14 @@ th { background:#222; }
 def ui():
     results = None
     if request.method == "POST":
-        chain = request.form["chain"]
-        cas = [c.strip() for c in request.form["contracts"].splitlines() if c.strip()]
-        payload = {"chain": chain, "contracts": cas}
-        with app.test_request_context():
-            results = analyze().json
+        chain = request.form.get("chain")
+        cas = [
+            c.strip()
+            for c in request.form.get("contracts", "").splitlines()
+            if c.strip()
+        ]
+        results = analyze_contracts(chain, cas)
+
     return render_template_string(HTML_UI, results=results)
 
 
@@ -233,7 +247,11 @@ def ui():
 # =====================================================
 @app.route("/")
 def home():
-    return {"status": "running", "mode": "LIVE FETCH ONLY"}
+    return {
+        "status": "running",
+        "mode": "LIVE FETCH",
+        "usage": "/ui for browser, /analyze for API"
+    }
 
 
 if __name__ == "__main__":
