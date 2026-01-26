@@ -1,5 +1,3 @@
-import threading
-import time
 import requests
 import numpy as np
 import subprocess
@@ -8,49 +6,32 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-SCAN_INTERVAL = 60  # seconds
-CACHE = {"solana": {}, "bsc": {}}
-
 # =====================================================
-# Utility
+# Utils
 # =====================================================
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
 # =====================================================
-# LLM Interpretation Layer (FREE via Ollama)
-# Requires: ollama run llama3
+# LIVE FETCH BY CA (CRITICAL FIX)
 # =====================================================
-def llm_interpretation(data):
+def fetch_pair_by_ca(ca):
     """
-    LLM is used ONLY for interpretation & risk gating,
-    NOT for price prediction.
+    Fetch token pair LIVE using CA.
+    Works for very new coins once a pair exists.
     """
-    prompt = f"""
-You are a crypto market risk analyst.
-Do NOT predict prices.
-
-Return ONLY valid JSON in this format:
-{{"verdict":"ALLOW|CAUTION|BLOCK","confidence_adjustment":-0.3 to 0.1,"reason":"short text"}}
-
-Data:
-{json.dumps(data)}
-"""
+    url = f"https://api.dexscreener.com/latest/dex/search/?q={ca}"
     try:
-        result = subprocess.run(
-            ["ollama", "run", "llama3", prompt],
-            capture_output=True,
-            text=True,
-            timeout=12
-        )
-        return json.loads(result.stdout.strip())
+        r = requests.get(url, timeout=10).json()
+        pairs = r.get("pairs", [])
+        for p in pairs:
+            base = p.get("baseToken", {})
+            if base.get("address", "").lower() == ca.lower():
+                return p
+        return None
     except Exception:
-        return {
-            "verdict": "CAUTION",
-            "confidence_adjustment": -0.05,
-            "reason": "LLM unavailable or timeout"
-        }
+        return None
 
 
 # =====================================================
@@ -63,7 +44,7 @@ def score_pair(pair):
     vol1h = pair.get("volume", {}).get("h1", 0)
     pc5 = pair.get("priceChange", {}).get("m5", 0)
 
-    if liquidity < 5000:
+    if liquidity < 3000:
         return None
 
     vol_liq = vol5 / liquidity if liquidity else 0
@@ -94,106 +75,100 @@ def score_pair(pair):
 
 
 # =====================================================
-# Monthly Historical Proxy Backtest (Free)
+# LLM INTERPRETATION (OPTIONAL, SAFE FALLBACK)
 # =====================================================
-def monthly_backtest(pair_address, chain):
-    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
+def llm_interpretation(data):
+    """
+    If Ollama is not installed, this safely falls back.
+    """
+    prompt = f"""
+You are a crypto risk analyst.
+Do NOT predict prices.
+
+Return JSON only:
+{{"verdict":"ALLOW|CAUTION|BLOCK","confidence_adjustment":-0.3 to 0.1,"reason":"text"}}
+
+Data:
+{json.dumps(data)}
+"""
     try:
-        r = requests.get(url, timeout=10).json().get("pair")
-        if not r:
-            return None
-
-        pc24 = r.get("priceChange", {}).get("h24", 0)
-
-        return {
-            "24h_return_x": round(1 + pc24 / 100, 2),
-            "hit_2x": pc24 >= 100,
-            "hit_5x": pc24 >= 400,
-            "hit_10x": pc24 >= 900
-        }
+        result = subprocess.run(
+            ["ollama", "run", "llama3", prompt],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return json.loads(result.stdout.strip())
     except Exception:
-        return None
+        return {
+            "verdict": "CAUTION",
+            "confidence_adjustment": -0.05,
+            "reason": "LLM not available"
+        }
 
 
 # =====================================================
-# Background Scanner (Auto Refresh)
-# =====================================================
-def scanner():
-    global CACHE
-    while True:
-        new_cache = {"solana": {}, "bsc": {}}
-
-        for chain in ["solana", "bsc"]:
-            url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}"
-            try:
-                pairs = requests.get(url, timeout=10).json().get("pairs", [])
-            except Exception:
-                continue
-
-            for p in pairs:
-                token = p.get("baseToken", {})
-                ca = token.get("address")
-                if not ca:
-                    continue
-
-                score = score_pair(p)
-                if not score:
-                    continue
-
-                llm = llm_interpretation(score)
-                final_conf = max(
-                    0,
-                    min(1, score["confidence"] + llm["confidence_adjustment"])
-                )
-
-                new_cache[chain][ca] = {
-                    "name": token.get("name"),
-                    "symbol": token.get("symbol"),
-                    "chain": chain,
-                    "score": {**score, "final_confidence": round(final_conf, 2)},
-                    "llm_verdict": llm["verdict"],
-                    "llm_reason": llm["reason"]
-                }
-
-        CACHE = new_cache
-        time.sleep(SCAN_INTERVAL)
-
-
-threading.Thread(target=scanner, daemon=True).start()
-
-# =====================================================
-# API: Analyze pasted CAs
+# API: ANALYZE (LIVE, NO CACHE)
 # =====================================================
 @app.route("/analyze", methods=["POST"])
 def analyze():
     data = request.json
-    chain = data["chain"]
-    contracts = data["contracts"]
+    chain = data.get("chain")
+    contracts = data.get("contracts", [])
 
-    out = {}
+    results = {}
+
     for ca in contracts:
-        token = CACHE.get(chain, {}).get(ca)
-        if not token:
-            out[ca] = {"signal": "LOW", "reason": "Not detected or insufficient data"}
-        else:
-            token["monthly_backtest"] = monthly_backtest(ca, chain)
-            out[ca] = token
+        pair = fetch_pair_by_ca(ca)
 
-    return jsonify(out)
+        if not pair:
+            results[ca] = {
+                "signal": "LOW",
+                "reason": "Pair not indexed yet (VERY EARLY or no LP)"
+            }
+            continue
+
+        score = score_pair(pair)
+        if not score:
+            results[ca] = {
+                "signal": "LOW",
+                "reason": "Liquidity too low"
+            }
+            continue
+
+        llm = llm_interpretation(score)
+        final_conf = max(
+            0,
+            min(1, score["confidence"] + llm["confidence_adjustment"])
+        )
+
+        token = pair.get("baseToken", {})
+
+        results[ca] = {
+            "name": token.get("name"),
+            "symbol": token.get("symbol"),
+            "chain": chain,
+            "score": {**score, "final_confidence": round(final_conf, 2)},
+            "llm_verdict": llm["verdict"],
+            "llm_reason": llm["reason"],
+            "note": "Live fetched"
+        }
+
+    return jsonify(results)
 
 
 # =====================================================
-# Simple Browser UI (Boxes to Paste CAs)
+# SIMPLE UI (MOBILE FRIENDLY)
 # =====================================================
 HTML_UI = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>CA Analyzer</title>
+<title>Live CA Analyzer</title>
 <style>
-body { background:#111; color:#eee; font-family:Arial; padding:20px; }
-textarea { width:100%; height:140px; background:#222; color:#0f0; }
-select,button { padding:8px; margin-top:10px; }
+body { background:#111; color:#eee; font-family:Arial; padding:15px; }
+textarea { width:100%; height:160px; background:#222; color:#0f0; font-size:14px; }
+select,button { padding:10px; margin-top:10px; width:100%; }
 table { width:100%; margin-top:20px; border-collapse:collapse; }
 th,td { border:1px solid #333; padding:6px; text-align:center; }
 th { background:#222; }
@@ -201,24 +176,28 @@ th { background:#222; }
 </head>
 <body>
 
-<h2>🔍 Paste Contract Addresses</h2>
+<h2>🔴 LIVE Coin Analyzer</h2>
 
 <form method="post">
 <select name="chain">
 <option value="solana">Solana</option>
 <option value="bsc">BSC</option>
-</select><br><br>
+</select>
 
-<textarea name="contracts" placeholder="One CA per line"></textarea><br>
-<button type="submit">Analyze</button>
+<textarea name="contracts" placeholder="Paste contract addresses, one per line"></textarea>
+<button type="submit">Analyze (Live)</button>
 </form>
 
 {% if results %}
-<h2>📊 Results</h2>
 <table>
 <tr>
-<th>Token</th><th>p10x</th><th>p20x</th><th>p50x</th><th>p100x</th>
-<th>Final Conf</th><th>LLM</th><th>Reason</th>
+<th>Token</th>
+<th>p10x</th>
+<th>p20x</th>
+<th>p50x</th>
+<th>p100x</th>
+<th>Conf</th>
+<th>LLM</th>
 </tr>
 {% for ca,r in results.items() %}
 <tr>
@@ -229,7 +208,6 @@ th { background:#222; }
 <td>{{ r.get("score",{}).get("p_100x","-") }}</td>
 <td>{{ r.get("score",{}).get("final_confidence","-") }}</td>
 <td>{{ r.get("llm_verdict","-") }}</td>
-<td>{{ r.get("llm_reason","-") }}</td>
 </tr>
 {% endfor %}
 </table>
@@ -244,27 +222,18 @@ def ui():
     if request.method == "POST":
         chain = request.form["chain"]
         cas = [c.strip() for c in request.form["contracts"].splitlines() if c.strip()]
-        results = {}
-        for ca in cas:
-            results[ca] = CACHE.get(chain, {}).get(ca, {
-                "llm_verdict": "LOW",
-                "llm_reason": "Not detected yet"
-            })
+        payload = {"chain": chain, "contracts": cas}
+        with app.test_request_context():
+            results = analyze().json
     return render_template_string(HTML_UI, results=results)
 
 
 # =====================================================
-# Health Check
+# HEALTH CHECK
 # =====================================================
 @app.route("/")
 def home():
-    return {
-        "status": "running",
-        "tracked": {
-            "solana": len(CACHE.get("solana", {})),
-            "bsc": len(CACHE.get("bsc", {}))
-        }
-    }
+    return {"status": "running", "mode": "LIVE FETCH ONLY"}
 
 
 if __name__ == "__main__":
