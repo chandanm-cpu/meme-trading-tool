@@ -18,8 +18,8 @@ HTML = """
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="10">
-<title>Low MC 100× Filter</title>
+<meta http-equiv="refresh" content="15">
+<title>20k–400k MC Structural Filter</title>
 <style>
 body { font-family: Arial; background:#0f172a; color:#e5e7eb; margin:0 }
 .container { padding:16px; max-width:620px; margin:auto }
@@ -36,8 +36,8 @@ button { width:100%; padding:12px; background:#22c55e; border:none; border-radiu
 </head>
 <body>
 <div class="container">
-<h2>🔍 Low MC 100× Structural Filter</h2>
-<p class="small">Auto refresh: 10s • Focus: 20k–100k MC</p>
+<h2>🔍 20k–400k MC Structural Filter</h2>
+<p class="small">Auto refresh: 15s • Early + Mid-Early coins only</p>
 
 <form method="post">
 <textarea name="cas">{{cas}}</textarea>
@@ -68,23 +68,26 @@ button { width:100%; padding:12px; background:#22c55e; border:none; border-radiu
 """
 
 def fetch(ca):
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
-    r = requests.get(url, timeout=10)
-    j = r.json()
-    if "pairs" not in j or not j["pairs"]:
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+        r = requests.get(url, timeout=10)
+        j = r.json()
+        if "pairs" not in j or not j["pairs"]:
+            return None
+
+        p = j["pairs"][0]
+        tx = p.get("txns", {}).get("h24", {})
+
+        return {
+            "name": p.get("baseToken", {}).get("name", "Unknown"),
+            "symbol": p.get("baseToken", {}).get("symbol", "UNK"),
+            "fdv": float(p.get("fdv") or 0),
+            "liq": float(p.get("liquidity", {}).get("usd") or 0),
+            "buys": tx.get("buys", 0),
+            "sells": tx.get("sells", 0),
+        }
+    except:
         return None
-
-    p = j["pairs"][0]
-    tx = p.get("txns", {}).get("h24", {})
-
-    return {
-        "name": p.get("baseToken", {}).get("name", "Unknown"),
-        "symbol": p.get("baseToken", {}).get("symbol", "UNK"),
-        "fdv": float(p.get("fdv") or 0),
-        "liq": float(p.get("liquidity", {}).get("usd") or 0),
-        "buys": tx.get("buys", 0),
-        "sells": tx.get("sells", 0),
-    }
 
 def scarcity_score(fdv, liq, buys, sells):
     if fdv == 0:
@@ -123,7 +126,7 @@ def index():
             continue
 
         d = fetch(ca)
-        if not d or d["fdv"] < 20000:
+        if not d or d["fdv"] < 20000 or d["fdv"] > 400000:
             continue
 
         mc = int(d["fdv"])
@@ -139,13 +142,15 @@ def index():
             SEEN[ca] = now
         age = now - SEEN[ca]
 
-        if mc < 100000:
-            sc_t, dm_t = 75, 50
+        if mc <= 100000:
+            sc_t, dm_t, acc_t = 75, 50, 15
+        elif mc <= 250000:
+            sc_t, dm_t, acc_t = 80, 65, 20
         else:
-            sc_t, dm_t = 70, 70
+            sc_t, dm_t, acc_t = 85, 75, 25
 
         ml_prob = None
-        if sc >= sc_t and dm >= dm_t and accel >= 15 and liq_delta >= 0:
+        if sc >= sc_t and dm >= dm_t and accel >= acc_t and liq_delta >= 0:
             tier, cls, ttl = "🚀 Tier A — Structural + Acceleration", "a", TIER_A_TTL
             ml_prob = ml_probability(sc, dm, accel)
         elif sc >= sc_t:
@@ -176,7 +181,7 @@ def index():
             "tier": tier,
             "cls": cls,
             "ml_prob": ml_prob,
-            "time_left": time_left,
+            "time_left": time_left
         })
 
     return render_template_string(HTML, results=results, cas=cas_text)
