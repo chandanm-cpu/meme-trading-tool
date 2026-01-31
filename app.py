@@ -3,183 +3,218 @@ import requests, time, math, os
 
 app = Flask(__name__)
 
-# ---------------- MEMORY ----------------
 PREV = {}
 SEEN = {}
-RPC_PREV = {}
+LAST_SKIPPED = {}
+LAST_TIER = {}   # 🔔 used for B → A alert
 
-# ---------------- RPC ENDPOINTS ----------------
-SOL_RPC = "https://api.mainnet-beta.solana.com"
-BSC_RPC = "https://bsc-dataseed.binance.org"
-
-# ---------------- LIMITS ----------------
-MAX_RPC_CALLS = 10  # rate-limit safety
-
-# ---------------- TTL ----------------
 TIER_A_TTL = 20 * 60
 TIER_B_TTL = 40 * 60
 TIER_C_TTL = 10 * 60
 
-# ---------------- UI ----------------
+AUTO_RECHECK_SECONDS = 120
+
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="15">
-<title>20k–400k MC Prediction Filter</title>
+<title>20k–400k MC Structural Filter</title>
 <style>
-body { font-family: Arial; background:#0f172a; color:#e5e7eb }
-.container { max-width:650px; margin:auto; padding:15px }
-textarea { width:100%; height:120px }
-button { width:100%; padding:10px; margin-top:8px }
-.card { background:#1e293b; padding:12px; margin-top:10px; border-radius:10px }
+body { font-family: Arial; background:#0f172a; color:#e5e7eb; margin:0 }
+.container { max-width:780px; margin:auto; padding:15px }
+textarea { width:100%; height:120px; border-radius:6px; padding:8px }
+button { width:100%; padding:10px; margin-top:8px; border-radius:6px }
+.card { background:#1e293b; padding:12px; margin-top:12px; border-radius:10px }
 .a{color:#4ade80} .b{color:#facc15} .c{color:#60a5fa} .d{color:#f87171}
+.alert{color:#fb7185;font-weight:bold}
+.new{color:#22c55e;font-weight:bold}
 .small{font-size:12px;color:#94a3b8}
-.ca{word-break:break-all;font-size:11px}
+.ca{word-break:break-all;font-size:11px;color:#94a3b8}
+ul{margin:6px 0 0 16px;padding:0}
+hr{border:0;border-top:1px solid #334155;margin:20px 0}
 </style>
 </head>
 <body>
 <div class="container">
-<h2>🔍 Structural + RPC Filter</h2>
+<h2>🔍 Structural Filter (20k–400k MC)</h2>
+
 <form method="post">
 <textarea name="cas">{{cas}}</textarea>
-<button>Analyze</button>
+<button name="action" value="analyze">Analyze</button>
+<button name="action" value="recheck">Recheck Skipped Coins</button>
 </form>
 
 {% for r in results %}
 <div class="card">
+{% if r.alert %}
+<div class="alert">🚨 ALERT: Tier B → Tier A</div>
+{% endif %}
+{% if r.new %}
+<div class="new">🆕 BECAME ELIGIBLE</div>
+{% endif %}
 <div class="{{r.cls}}"><b>{{r.tier}}</b></div>
 <b>{{r.name}} ({{r.symbol}})</b>
 <div class="ca">{{r.ca}}</div>
-<div class="small">MC: ${{r.mc}} | Liq: ${{r.liq}}</div>
+
+<div class="small">MC: ${{r.mc}} | Liquidity: ${{r.liq}}</div>
 <div class="small">Scarcity: {{r.sc}} | Demand: {{r.dm}} | Accel: {{r.acc}}</div>
-<div class="small">RPC/min: {{r.rpc_rate}} | RPC Δ: {{r.rpc_delta}}</div>
-{% if r.ml %}
-<div class="small">🧠 ML Prob: {{r.ml}}%</div>
+
+{% if r.conf %}
+<div class="small"><b>Confidence:</b> {{r.conf}} / 100</div>
+{% endif %}
+
+{% if r.why %}
+<div class="small"><b>Why this tier:</b></div>
+<ul class="small">
+{% for w in r.why %}<li>{{w}}</li>{% endfor %}
+</ul>
 {% endif %}
 </div>
 {% endfor %}
+
+{% if skipped %}
+<hr>
+<h3>⚠️ Skipped Coins</h3>
+{% for s in skipped %}
+<div class="card">
+<div class="d"><b>Skipped</b></div>
+<div class="ca">{{s.ca}}</div>
+<div class="small">Reason: {{s.reason}}</div>
+</div>
+{% endfor %}
+{% endif %}
 </div>
 </body>
 </html>
 """
 
-# ---------------- DEXSCREENER ----------------
-def dex(ca):
+# ---------------- DATA ----------------
+def fetch_dex(ca):
     try:
         j = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{ca}",
             timeout=8
         ).json()
-        if not j.get("pairs"): return None
+
+        if not j.get("pairs"):
+            return None, "No active DexScreener pair yet"
+
         p = j["pairs"][0]
         tx = p.get("txns", {}).get("h24", {})
+
+        if p.get("fdv") is None:
+            return None, "Market cap data unavailable"
+        if p.get("liquidity", {}).get("usd") is None:
+            return None, "Liquidity data unavailable"
+        if not tx:
+            return None, "Buy/Sell data unavailable"
+
         return {
             "name": p["baseToken"]["name"],
             "symbol": p["baseToken"]["symbol"],
-            "fdv": float(p.get("fdv") or 0),
-            "liq": float(p.get("liquidity", {}).get("usd") or 0),
+            "fdv": float(p["fdv"]),
+            "liq": float(p["liquidity"]["usd"]),
             "buys": tx.get("buys", 0),
             "sells": tx.get("sells", 0),
-            "chain": p.get("chainId")
-        }
+        }, None
     except:
-        return None
-
-# ---------------- RPC ACTIVITY ----------------
-def rpc_activity(ca, chain):
-    try:
-        if chain == "solana":
-            payload = {
-                "jsonrpc":"2.0","id":1,
-                "method":"getSignaturesForAddress",
-                "params":[ca,{"limit":15}]
-            }
-            r = requests.post(SOL_RPC, json=payload, timeout=6).json()
-            return len(r.get("result", []))
-        elif chain == "bsc":
-            payload = {
-                "jsonrpc":"2.0","id":1,
-                "method":"eth_getTransactionCount",
-                "params":[ca,"latest"]
-            }
-            r = requests.post(BSC_RPC, json=payload, timeout=6).json()
-            return int(r.get("result","0x0"),16)
-    except:
-        return 0
+        return None, "API error / rate limit"
 
 # ---------------- SCORES ----------------
 def scarcity(fdv, liq, buys, sells):
-    if fdv == 0: return 0
     s = 0
-    if liq/fdv < 0.1: s+=40
-    if liq/fdv < 0.05: s+=30
-    if sells < buys*0.8: s+=20
-    if sells < 20: s+=10
-    return min(s,100)
+    r = liq / fdv
+    if r < 0.10: s += 40
+    if r < 0.05: s += 30
+    if sells < buys * 0.8: s += 20
+    if sells < 20: s += 10
+    return min(s, 100)
 
-def demand(buys, sells, rpc_rate):
+def demand(buys, sells):
     d = 0
-    if buys/max(sells,1) > 1.4: d+=40
-    if buys > 60: d+=30
-    if rpc_rate >= 8: d+=30
-    return min(d,100)
+    r = buys / max(sells, 1)
+    if r > 1.3: d += 30
+    if r > 1.6: d += 30
+    if buys > 80: d += 20
+    if buys + sells > 150: d += 20
+    return min(d, 100)
 
-def ml_prob(sc, dm, acc):
-    return round((1/(1+math.exp(-(0.04*sc+0.05*dm+0.08*acc-10))))*100,1)
+def confidence(sc, dm, acc, st, dt, at):
+    return min(100, int((sc/st)*30 + (dm/dt)*40 + (acc/at)*30))
 
 # ---------------- MAIN ----------------
 @app.route("/", methods=["GET","POST"])
 def index():
-    results=[]
-    cas=request.form.get("cas","")
-    now=time.time()
-    rpc_calls=0
+    action = request.form.get("action", "analyze")
+    cas = request.form.get("cas", "")
 
-    for ca in cas.splitlines():
-        ca=ca.strip()
-        if not ca: continue
+    results, skipped = [], []
+    targets = list(LAST_SKIPPED.keys()) if action == "recheck" else [c.strip() for c in cas.splitlines() if c.strip()]
 
-        d=dex(ca)
-        if not d or d["fdv"]<20000 or d["fdv"]>400000:
+    for ca in targets:
+        d, err = fetch_dex(ca)
+        if err:
+            skipped.append({"ca": ca, "reason": err})
+            LAST_SKIPPED[ca] = err
             continue
 
-        rpc_rate=0
-        rpc_delta=0
-        if rpc_calls<MAX_RPC_CALLS:
-            rpc_rate=rpc_activity(ca,d["chain"])
-            prev=RPC_PREV.get(ca,0)
-            rpc_delta=rpc_rate-prev
-            RPC_PREV[ca]=rpc_rate
-            rpc_calls+=1
+        if d["fdv"] < 20000 or d["fdv"] > 400000:
+            skipped.append({"ca": ca, "reason": "Market cap outside 20k–400k"})
+            LAST_SKIPPED[ca] = "MC outside range"
+            continue
 
-        sc=scarcity(d["fdv"],d["liq"],d["buys"],d["sells"])
-        dm=demand(d["buys"],d["sells"],rpc_rate)
+        LAST_SKIPPED.pop(ca, None)
 
-        prev=PREV.get(ca,{"dm":dm})
-        acc=dm-prev["dm"]
-        PREV[ca]={"dm":dm}
+        sc = scarcity(d["fdv"], d["liq"], d["buys"], d["sells"])
+        dm = demand(d["buys"], d["sells"])
+        acc = dm - PREV.get(ca, {"dm": dm})["dm"]
+        PREV[ca] = {"dm": dm}
 
-        tier,cls,ml="❌ Tier D","d",None
-        if sc>=75 and dm>=50 and acc>=15:
-            tier,cls="🚀 Tier A","a"
-            ml=ml_prob(sc,dm,acc)
-        elif sc>=75:
-            tier,cls="👀 Tier B","b"
-        elif dm>=60:
-            tier,cls="👀 Tier C","c"
+        mc = d["fdv"]
+        if mc <= 100000:
+            st, dt, at = 75, 50, 15
+        elif mc <= 250000:
+            st, dt, at = 80, 65, 20
+        else:
+            st, dt, at = 85, 75, 25
+
+        tier, cls, why, conf = "❌ Tier D", "d", None, None
+
+        if sc >= st and dm >= dt and acc >= at:
+            tier, cls = "🚀 Tier A", "a"
+            conf = confidence(sc, dm, acc, st, dt, at)
+            why = ["Scarcity + demand + acceleration aligned"]
+        elif sc >= st:
+            tier, cls = "👀 Tier B", "b"
+            why = ["Scarcity present, demand pending"]
+        elif dm >= dt:
+            tier, cls = "👀 Tier C", "c"
+            why = ["Demand present, structure weak"]
+
+        alert = LAST_TIER.get(ca) == "👀 Tier B" and tier == "🚀 Tier A"
+        LAST_TIER[ca] = tier
 
         results.append({
-            "ca":ca,"name":d["name"],"symbol":d["symbol"],
-            "mc":int(d["fdv"]),"liq":int(d["liq"]),
-            "sc":sc,"dm":dm,"acc":acc,
-            "rpc_rate":rpc_rate,"rpc_delta":rpc_delta,
-            "tier":tier,"cls":cls,"ml":ml
+            "ca": ca,
+            "name": d["name"],
+            "symbol": d["symbol"],
+            "mc": int(mc),
+            "liq": int(d["liq"]),
+            "sc": sc,
+            "dm": dm,
+            "acc": acc,
+            "tier": tier,
+            "cls": cls,
+            "why": why,
+            "conf": conf,
+            "alert": alert,
+            "new": False
         })
 
-    return render_template_string(HTML,results=results,cas=cas)
+    return render_template_string(HTML, results=results, skipped=skipped, cas=cas)
 
-if __name__=="__main__":
-    port=int(os.environ.get("PORT",10000))
-    app.run(host="0.0.0.0",port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
