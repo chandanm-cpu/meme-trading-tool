@@ -3,35 +3,32 @@ import requests, time, os, datetime
 
 app = Flask(__name__)
 
-# ---------------- STATE ----------------
+# ===================== STATE =====================
 PREV_DEMAND = {}
 LAST_TIER = {}
 LAST_SKIPPED = {}
-TIER_HISTORY = []
+TIER_HISTORY = {}
 
-# ---------------- CONFIG ----------------
+# ===================== CONFIG =====================
 MC_MIN = 20000
 MC_MAX = 400000
-
-# Loosened Tier A (structural)
-ACCEL_STRICT = 8        # was 15
-DEMAND_STRICT = 60
-SCARCITY_STRICT = 75
-
-# Chaos mode
 CHAOS_MC_MAX = 60000
 
-# ---------------- HTML ----------------
+SCARCITY_STRICT = 75
+DEMAND_STRICT = 60
+ACCEL_STRICT = 8   # loosened
+
+# ===================== HTML =====================
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="15">
-<title>Structural + Chaos Scanner</title>
+<title>Structural + Diagnostics Scanner</title>
 <style>
 body{font-family:Arial;background:#0f172a;color:#e5e7eb;margin:0}
-.container{max-width:820px;margin:auto;padding:15px}
+.container{max-width:900px;margin:auto;padding:15px}
 textarea{width:100%;height:120px;border-radius:6px;padding:8px}
 button{width:100%;padding:10px;margin-top:8px;border-radius:6px}
 .card{background:#1e293b;padding:12px;margin-top:12px;border-radius:10px}
@@ -45,7 +42,7 @@ hr{border:0;border-top:1px solid #334155;margin:20px 0}
 </head>
 <body>
 <div class="container">
-<h2>🔍 Structural + Chaos Scanner</h2>
+<h2>🔍 Structural + Diagnostics Scanner</h2>
 
 <form method="post">
 <textarea name="cas">{{cas}}</textarea>
@@ -57,11 +54,12 @@ hr{border:0;border-top:1px solid #334155;margin:20px 0}
 {% if action == "history" %}
 <hr>
 <h3>📜 Tier Change History</h3>
-{% for h in history %}
+{% for ca,logs in history.items() %}
 <div class="card small">
-<b>{{h.ca}}</b><br>
-{{h.prev}} → {{h.curr}}<br>
-{{h.time}}
+<b>{{ca}}</b>
+{% for l in logs %}
+<div>{{l.time}} — {{l.prev}} → {{l.curr}}</div>
+{% endfor %}
 </div>
 {% endfor %}
 {% endif %}
@@ -78,8 +76,23 @@ hr{border:0;border-top:1px solid #334155;margin:20px 0}
 <div class="{{r.cls}}"><b>{{r.tier}}</b></div>
 <b>{{r.name}} ({{r.symbol}})</b>
 <div class="ca">{{r.ca}}</div>
-<div class="small">MC: ${{r.mc}} | Liquidity: ${{r.liq}}</div>
-<div class="small">Scarcity: {{r.sc}} | Demand: {{r.dm}} | Accel: {{r.acc}}</div>
+
+<div class="small">
+MC: ${{r.mc}} | Liquidity: ${{r.liq}}
+</div>
+
+<div class="small">
+Scarcity: {{r.sc}} | Demand: {{r.dm}} | Accel: {{r.acc}}
+</div>
+
+<hr>
+
+<div class="small"><b>Diagnostics</b></div>
+<div class="small">Organic Demand: {{r.organic}}</div>
+<div class="small">Narrative: {{r.narrative}}</div>
+<div class="small">Rug Risk: {{r.rug}}</div>
+<div class="small"><b>Adjusted Confidence:</b> {{r.conf}} / 100</div>
+
 </div>
 {% endfor %}
 {% endif %}
@@ -99,7 +112,7 @@ Reason: {{s.reason}}
 </html>
 """
 
-# ---------------- DATA ----------------
+# ===================== DATA =====================
 def fetch_dex(ca):
     try:
         j = requests.get(
@@ -127,7 +140,7 @@ def fetch_dex(ca):
     except:
         return None, "API error / rate limit"
 
-# ---------------- SCORES ----------------
+# ===================== CORE SCORES =====================
 def scarcity(fdv, liq, buys, sells):
     s = 0
     r = liq / fdv if fdv else 1
@@ -146,7 +159,37 @@ def demand(buys, sells):
     if buys + sells > 150: d += 20
     return min(d, 100)
 
-# ---------------- MAIN ----------------
+# ===================== DIAGNOSTICS =====================
+def organic_demand(buys, sells, acc):
+    if buys > 120 and acc > 10 and sells < buys * 0.7:
+        return "HIGH"
+    if buys > 60 and acc > 5:
+        return "MEDIUM"
+    return "LOW"
+
+def narrative_tag(symbol):
+    s = symbol.lower()
+    if "ai" in s: return "AI / Infra"
+    if "inu" in s or "dog" in s: return "Meme"
+    if "game" in s: return "Gaming"
+    return "Unknown / Speculative"
+
+def rug_risk(liq, mc, sells):
+    if liq / mc < 0.03:
+        return "HIGH (thin LP)"
+    if sells > 150:
+        return "MEDIUM (distribution)"
+    return "LOW"
+
+def confidence_score(sc, dm, acc, organic, rug):
+    base = int((sc * 0.4) + (dm * 0.4) + (max(acc,0) * 2))
+    if organic == "HIGH": base += 5
+    if organic == "LOW": base -= 10
+    if rug.startswith("HIGH"): base -= 20
+    if rug.startswith("MEDIUM"): base -= 10
+    return max(0, min(base, 100))
+
+# ===================== MAIN =====================
 @app.route("/", methods=["GET","POST"])
 def index():
     action = request.form.get("action", "analyze")
@@ -157,7 +200,7 @@ def index():
         return render_template_string(
             HTML,
             action=action,
-            history=TIER_HISTORY[::-1],
+            history=TIER_HISTORY,
             cas=cas
         )
 
@@ -198,8 +241,7 @@ def index():
 
         prev = LAST_TIER.get(ca)
         if prev and prev != tier:
-            TIER_HISTORY.append({
-                "ca": ca,
+            TIER_HISTORY.setdefault(ca, []).append({
                 "prev": prev,
                 "curr": tier,
                 "time": datetime.datetime.now().strftime("%H:%M:%S")
@@ -207,6 +249,11 @@ def index():
 
         alert = prev == "👀 Tier B" and tier == "🚀 Tier A"
         LAST_TIER[ca] = tier
+
+        organic = organic_demand(d["buys"], d["sells"], acc)
+        narrative = narrative_tag(d["symbol"])
+        rug = rug_risk(d["liq"], mc, d["sells"])
+        conf = confidence_score(sc, dm, acc, organic, rug)
 
         results.append({
             "ca": ca,
@@ -220,7 +267,11 @@ def index():
             "tier": tier,
             "cls": cls,
             "alert": alert,
-            "chaos": chaos
+            "chaos": chaos,
+            "organic": organic,
+            "narrative": narrative,
+            "rug": rug,
+            "conf": conf
         })
 
     return render_template_string(
