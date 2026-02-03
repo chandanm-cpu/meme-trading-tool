@@ -19,16 +19,13 @@ LABEL_AFTER_DAYS = 3
 MIN_ROWS_TO_TRAIN = 50
 DECAY_DAYS = 14
 
-# Tier thresholds
-MC_MIN = 20_000
-MC_MAX = 400_000
+# Tier thresholds (NO MC LIMITS)
 LMC_MIN = 3
 LMC_MAX = 10
 BUYSELL_STRONG = 1.3
 ACCEL_STRONG = 8
 
-# Viral madness thresholds
-VIRAL_MC_MAX = 200_000
+# Viral madness
 VIRAL_BUY_RATIO = 1.5
 VIRAL_TX_MIN = 30
 
@@ -62,11 +59,8 @@ def fetch_dex(ca):
     except:
         return None
 
-# ================= TIER LOGIC =================
-def tier_logic(mc, liq, buys, sells, accel):
-    if mc < MC_MIN or mc > MC_MAX:
-        return "❌ Tier D (MC out of range)"
-
+# ================= TIER LOGIC (NO MC FILTER) =================
+def tier_logic(liq, mc, buys, sells, accel):
     lmc = (liq / mc) * 100 if mc else 0
     bs = buys / max(sells, 1)
 
@@ -85,17 +79,10 @@ def tier_logic(mc, liq, buys, sells, accel):
     return "❌ Tier D"
 
 # ================= VIRAL MADNESS =================
-def viral_madness(mc, buys, sells):
+def viral_madness(buys, sells):
     tx = buys + sells
     bs = buys / max(sells, 1)
-
-    if (
-        mc <= VIRAL_MC_MAX and
-        tx >= VIRAL_TX_MIN and
-        bs >= VIRAL_BUY_RATIO
-    ):
-        return True
-    return False
+    return tx >= VIRAL_TX_MIN and bs >= VIRAL_BUY_RATIO
 
 # ================= SAVE SNAPSHOT =================
 def save_snapshot(ca, d, tier):
@@ -194,7 +181,10 @@ def ml_predict(lmc, buys, sells, accel):
     model = joblib.load(MODEL_FILE)
     probs = model.predict_proba([[lmc, buys, sells, accel]])[0]
     labels = model.classes_
-    return ", ".join(f"{k}:{int(v*100)}%" for k,v in sorted(dict(zip(labels, probs)).items(), key=lambda x: -x[1]))
+    return ", ".join(
+        f"{k}:{int(v*100)}%"
+        for k,v in sorted(dict(zip(labels, probs)).items(), key=lambda x: -x[1])
+    )
 
 def ml_confidence():
     if not os.path.exists(STATE_FILE):
@@ -206,7 +196,7 @@ def ml_confidence():
 
 # ================= UI =================
 HTML = """
-<h2>🧠 ML + Tier + Viral Scanner</h2>
+<h2>🧠 ML + Tier + Viral Scanner (No MC Filter)</h2>
 <p><b>Last Learned:</b> {{last}} | <b>ML Confidence:</b> {{conf}}%</p>
 
 <form method="post">
@@ -243,9 +233,8 @@ def index():
             if not d:
                 continue
 
-            tier = tier_logic(d["mc"], d["liq"], d["buys"], d["sells"], d["buys"])
-            viral = viral_madness(d["mc"], d["buys"], d["sells"])
-
+            tier = tier_logic(d["liq"], d["mc"], d["buys"], d["sells"], d["buys"])
+            viral = viral_madness(d["buys"], d["sells"])
             save_snapshot(ca, d, tier)
 
             lmc = (d["liq"] / d["mc"]) * 100 if d["mc"] else 0
