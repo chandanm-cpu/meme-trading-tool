@@ -1,2 +1,5 @@
 flask
 requests
+pandas
+scikit-learn
+joblib
