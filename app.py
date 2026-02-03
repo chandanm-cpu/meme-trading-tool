@@ -19,7 +19,7 @@ LABEL_AFTER_DAYS = 3
 MIN_ROWS_TO_TRAIN = 50
 DECAY_DAYS = 14
 
-# Tier thresholds (NO MC LIMITS)
+# Tier thresholds (NO MC FILTER)
 LMC_MIN = 3
 LMC_MAX = 10
 BUYSELL_STRONG = 1.3
@@ -59,7 +59,7 @@ def fetch_dex(ca):
     except:
         return None
 
-# ================= TIER LOGIC (NO MC FILTER) =================
+# ================= TIER LOGIC =================
 def tier_logic(liq, mc, buys, sells, accel):
     lmc = (liq / mc) * 100 if mc else 0
     bs = buys / max(sells, 1)
@@ -174,7 +174,7 @@ def lazy_cron():
     with open(STATE_FILE, "w") as f:
         f.write(today)
 
-# ================= ML PREDICTION =================
+# ================= ML HELPERS =================
 def ml_predict(lmc, buys, sells, accel):
     if not os.path.exists(MODEL_FILE):
         return "ML not ready"
@@ -194,10 +194,20 @@ def ml_confidence():
     freshness = max(0, 1 - (days / DECAY_DAYS))
     return int(freshness * 100), ("Today" if days == 0 else f"{days} days ago")
 
+def ml_sample_count():
+    if not os.path.exists(DATA_FILE):
+        return 0
+    df = pd.read_csv(DATA_FILE)
+    return df["outcome"].notna().sum()
+
 # ================= UI =================
 HTML = """
-<h2>🧠 ML + Tier + Viral Scanner (No MC Filter)</h2>
-<p><b>Last Learned:</b> {{last}} | <b>ML Confidence:</b> {{conf}}%</p>
+<h2>🧠 ML + Tier + Viral Scanner</h2>
+<p>
+<b>Last Learned:</b> {{last}} |
+<b>ML Confidence:</b> {{conf}}% |
+<b>ML Training Samples:</b> {{samples}}
+</p>
 
 <form method="post">
 <textarea name="cas" style="width:100%;height:120px"></textarea><br>
@@ -222,6 +232,7 @@ Buys/Sells: {{r.buys}} / {{r.sells}}<br>
 def index():
     lazy_cron()
     conf, last = ml_confidence()
+    samples = ml_sample_count()
 
     results = []
     if request.method == "POST":
@@ -252,7 +263,8 @@ def index():
         HTML,
         results=results,
         conf=conf,
-        last=last
+        last=last,
+        samples=samples
     )
 
 if __name__ == "__main__":
