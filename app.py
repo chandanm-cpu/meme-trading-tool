@@ -17,6 +17,7 @@ STATE_FILE = "state.txt"
 
 LABEL_AFTER_DAYS = 3
 MIN_ROWS_TO_TRAIN = 50
+DECAY_DAYS = 14   # after 14 days confidence becomes very low
 
 # ================= INIT CSV =================
 if not os.path.exists(DATA_FILE):
@@ -52,7 +53,7 @@ def save_snapshot(ca, data):
     lmc = round((liq / mc) * 100, 2) if mc else 0
     buys = data["buys"]
     sells = max(data["sells"], 1)
-    accel = buys  # simple proxy
+    accel = buys
     tier = "UNKNOWN"
 
     with open(DATA_FILE, "a", newline="") as f:
@@ -126,37 +127,63 @@ def train_model():
     joblib.dump(model, MODEL_FILE)
     return True
 
-# ================= LAZY CRON (FREE) =================
+# ================= LAZY CRON =================
 def lazy_cron():
     today = datetime.date.today().isoformat()
 
     if os.path.exists(STATE_FILE):
-        last_run = open(STATE_FILE).read().strip()
-        if last_run == today:
-            return  # already learned today
+        last = open(STATE_FILE).read().strip()
+        if last == today:
+            return False
 
-    print("🧠 Lazy cron running...")
     auto_label()
-    trained = train_model()
+    train_model()
 
     with open(STATE_FILE, "w") as f:
         f.write(today)
 
-    print("✅ Learning done for today.")
+    return True
 
-# ================= WEB APP =================
+# ================= CONFIDENCE DECAY =================
+def ml_confidence_decay():
+    if not os.path.exists(STATE_FILE):
+        return 0, "Never"
+
+    last = datetime.date.fromisoformat(open(STATE_FILE).read().strip())
+    days = (datetime.date.today() - last).days
+
+    freshness = max(0, 1 - (days / DECAY_DAYS))
+    confidence = int(freshness * 100)
+
+    if days == 0:
+        label = "Today"
+    elif days == 1:
+        label = "1 day ago"
+    else:
+        label = f"{days} days ago"
+
+    return confidence, label
+
+# ================= WEB UI =================
 HTML = """
 <h2>🧠 Free ML Scanner</h2>
+
+<p><b>Last Learned:</b> {{last_learned}}</p>
+<p><b>ML Confidence:</b> {{confidence}}%</p>
+
 <form method="post">
 <textarea name="cas" style="width:100%;height:120px"></textarea><br>
 <button>Scan Coins</button>
 </form>
+
 <pre>{{msg}}</pre>
 """
 
 @app.route("/", methods=["GET","POST"])
 def index():
-    lazy_cron()  # 👈 THIS IS THE MAGIC (FREE AUTO LEARNING)
+    lazy_cron()
+
+    confidence, last_learned = ml_confidence_decay()
 
     msg = ""
     if request.method == "POST":
@@ -170,7 +197,12 @@ def index():
                 save_snapshot(ca, d)
                 msg += f"Saved {ca}\n"
 
-    return render_template_string(HTML, msg=msg)
+    return render_template_string(
+        HTML,
+        msg=msg,
+        confidence=confidence,
+        last_learned=last_learned
+    )
 
 # ================= START =================
 if __name__ == "__main__":
