@@ -1,311 +1,207 @@
+import sys
+import os
+import csv
+import time
+import datetime
+import requests
+import pandas as pd
+import joblib
 from flask import Flask, request, render_template_string
-import requests, os, time, datetime
-from collections import Counter, deque
+from sklearn.ensemble import RandomForestClassifier
 
+# =====================================================
+# BASIC SETUP
+# =====================================================
 app = Flask(__name__)
 
-# =====================================================
-# CONFIG
-# =====================================================
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
-SOL_RPC = "https://api.mainnet-beta.solana.com"
+DATA_FILE = "coin_data.csv"
+MODEL_FILE = "ml_model.pkl"
 
-MC_MIN = 20000
-MC_MAX = 400000
-CHAOS_MC_MAX = 60000
+LABEL_AFTER_DAYS = 3
+MIN_ROWS_TO_TRAIN = 50
 
-LMC_MIN = 3      # %
-LMC_MAX = 10     # %
-
-BUYSELL_STRONG = 1.3
-ACCEL_STRONG = 8
-
-CACHE_TTL = 90
-TREND_WINDOW = 5
+IS_CRON = "--cron" in sys.argv
 
 # =====================================================
-# GLOBAL STATE
+# CREATE CSV IF NOT EXISTS
 # =====================================================
-PREV_BUYS = {}
-LAST_TIER = {}
-TIER_HISTORY = {}
-RPC_CACHE = {}
-ORGANIC_HISTORY = {}
-LAST_LIQ = {}
-
-# =====================================================
-# HTML
-# =====================================================
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="15">
-<title>Advanced Tier Engine</title>
-<style>
-body{font-family:Arial;background:#0f172a;color:#e5e7eb}
-.container{max-width:920px;margin:auto;padding:15px}
-textarea{width:100%;height:120px}
-button{width:100%;padding:10px;margin-top:6px}
-.card{background:#1e293b;padding:12px;margin-top:10px;border-radius:10px}
-.early{color:#60a5fa}
-.confirmed{color:#4ade80}
-.b{color:#facc15}
-.c{color:#fb923c}
-.d{color:#f87171}
-.chaos{color:#fb923c;font-weight:bold}
-.alert{color:#fb7185;font-weight:bold}
-.small{font-size:12px;color:#94a3b8}
-.ca{word-break:break-all;font-size:11px}
-hr{border:0;border-top:1px solid #334155;margin:14px 0}
-</style>
-</head>
-<body>
-<div class="container">
-<h2>🔬 Advanced Structural Scanner</h2>
-
-<form method="post">
-<textarea name="cas">{{cas}}</textarea>
-<button>Analyze</button>
-</form>
-
-{% for r in results %}
-<div class="card">
-{% if r.alert %}
-<div class="alert">🚨 AUTO DOWNGRADE / UPGRADE</div>
-{% endif %}
-{% if r.chaos %}
-<div class="chaos">⚡ CHAOS MODE (High Risk)</div>
-{% endif %}
-
-<div class="{{r.cls}}"><b>{{r.tier}}</b></div>
-<b>{{r.name}} ({{r.symbol}})</b>
-<div class="ca">{{r.ca}}</div>
-
-<div class="small">
-MC: ${{r.mc}} | LP: ${{r.liq}} | L/MC: {{r.lmc}}%
-</div>
-<div class="small">
-Buy/Sell: {{r.bs}} | Accel: {{r.acc}}
-</div>
-
-<hr>
-<div class="small"><b>Diagnostics</b></div>
-<div class="small">Organic Demand: {{r.organic}}</div>
-<div class="small">Organic Trend: {{r.trend}}</div>
-<div class="small">Wallet Clustering: {{r.cluster}}</div>
-<div class="small">Rug Risk: {{r.rug}}</div>
-<div class="small"><b>Confidence:</b> {{r.conf}} / 100</div>
-</div>
-{% endfor %}
-</div>
-</body>
-</html>
-"""
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp",
+            "ca",
+            "mc_at_scan",
+            "liq",
+            "lmc",
+            "buys",
+            "sells",
+            "accel",
+            "tier",
+            "mc_latest",
+            "outcome",
+            "labeled_at"
+        ])
 
 # =====================================================
 # HELPERS
 # =====================================================
-def cached(key, fn):
-    now = time.time()
-    if key in RPC_CACHE:
-        ts, data = RPC_CACHE[key]
-        if now - ts < CACHE_TTL:
-            return data
-    data = fn()
-    RPC_CACHE[key] = (now, data)
-    return data
-
-# =====================================================
-# DEX DATA
-# =====================================================
 def fetch_dex(ca):
     try:
-        j = requests.get(DEX_URL + ca, timeout=8).json()
-        if not j.get("pairs"):
+        r = requests.get(DEX_URL + ca, timeout=10).json()
+        if not r.get("pairs"):
             return None
-        p = j["pairs"][0]
+        p = r["pairs"][0]
         tx = p.get("txns", {}).get("h24", {})
         return {
-            "name": p["baseToken"]["name"],
-            "symbol": p["baseToken"]["symbol"],
-            "fdv": float(p.get("fdv") or 0),
+            "mc": float(p.get("fdv") or 0),
             "liq": float(p.get("liquidity", {}).get("usd") or 0),
             "buys": tx.get("buys", 0),
             "sells": tx.get("sells", 0),
-            "chain": p.get("chainId")
         }
     except:
         return None
 
-# =====================================================
-# SOLANA BUYER PROXY
-# =====================================================
-def sol_signers(token):
-    def fetch():
-        payload = {
-            "jsonrpc":"2.0","id":1,
-            "method":"getSignaturesForAddress",
-            "params":[token,{"limit":50}]
-        }
-        r = requests.post(SOL_RPC, json=payload, timeout=8).json()
-        if "result" not in r:
-            return []
-        return [tx["signature"][:6] for tx in r["result"]]
-    return cached(("sol", token), fetch)
+def save_snapshot(ca, data):
+    mc = data["mc"]
+    liq = data["liq"]
+    lmc = round((liq / mc) * 100, 2) if mc else 0
+    buys = data["buys"]
+    sells = max(data["sells"], 1)
+    accel = buys  # simple for now
+    tier = "UNKNOWN"
+
+    with open(DATA_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.datetime.utcnow().isoformat(),
+            ca,
+            mc,
+            liq,
+            lmc,
+            buys,
+            sells,
+            accel,
+            tier,
+            "",
+            "",
+            ""
+        ])
 
 # =====================================================
-# ORGANIC + CLUSTER
+# AUTO LABEL (RUN BY CRON)
 # =====================================================
-def analyze_wallets(buyers):
-    if not buyers:
-        return "LOW", "HIGH"
-    c = Counter(buyers)
-    total = sum(c.values())
-    unique = len(c)
-    top_ratio = max(c.values()) / total
+def auto_label():
+    df = pd.read_csv(DATA_FILE)
+    now = datetime.datetime.utcnow()
 
-    cluster = "LOW"
-    if top_ratio > 0.5: cluster = "HIGH"
-    elif top_ratio > 0.35: cluster = "MEDIUM"
+    changed = False
 
-    if unique >= 25 and cluster == "LOW":
-        organic = "HIGH"
-    elif unique >= 10:
-        organic = "MEDIUM"
-    else:
-        organic = "LOW"
-
-    return organic, cluster
-
-def update_trend(ca, organic):
-    hist = ORGANIC_HISTORY.setdefault(ca, deque(maxlen=TREND_WINDOW))
-    hist.append(organic)
-    if len(hist) < 3:
-        return "FLAT"
-    if hist[-1] == "HIGH" and hist[-2] != "HIGH":
-        return "↑ Improving"
-    if hist[-1] == "LOW" and hist[-2] != "LOW":
-        return "↓ Deteriorating"
-    return "FLAT"
-
-# =====================================================
-# RISK + CONFIDENCE
-# =====================================================
-def rug_risk(cluster, organic, liq, mc):
-    if liq / mc < 0.03:
-        return "HIGH"
-    if cluster == "HIGH" and organic == "LOW":
-        return "HIGH"
-    if cluster == "MEDIUM":
-        return "MEDIUM"
-    return "LOW"
-
-def confidence(lmc_ok, p3, p4, organic, rug):
-    score = 50
-    if lmc_ok: score += 15
-    if p3: score += 10
-    if p4: score += 10
-    if organic == "HIGH": score += 5
-    if organic == "LOW": score -= 10
-    if rug == "HIGH": score -= 25
-    if rug == "MEDIUM": score -= 10
-    return max(0, min(score, 100))
-
-# =====================================================
-# MAIN
-# =====================================================
-@app.route("/", methods=["GET","POST"])
-def index():
-    cas = request.form.get("cas","")
-    results = []
-
-    for ca in [c.strip() for c in cas.splitlines() if c.strip()]:
-        d = fetch_dex(ca)
-        if not d or d["fdv"] == 0:
+    for i, row in df.iterrows():
+        if pd.notna(row["outcome"]):
             continue
 
-        mc = d["fdv"]
-        if mc < MC_MIN or mc > 5_000_000:
+        scan_time = datetime.datetime.fromisoformat(row["timestamp"])
+        if (now - scan_time).days < LABEL_AFTER_DAYS:
             continue
 
-        liq = d["liq"]
-        lmc = round((liq / mc) * 100, 2)
-
-        buys = d["buys"]
-        sells = max(d["sells"], 1)
-        bs_ratio = round(buys / sells, 2)
-
-        prev = PREV_BUYS.get(ca, buys)
-        acc = buys - prev
-        PREV_BUYS[ca] = buys
-
-        # ---- P CONDITIONS ----
-        p1 = LMC_MIN <= lmc <= LMC_MAX
-        p2 = liq > 0 and LAST_LIQ.get(ca, liq) <= liq
-        p3 = bs_ratio > BUYSELL_STRONG
-        p4 = acc >= ACCEL_STRONG
-        LAST_LIQ[ca] = liq
-
-        # ---- WALLET LAYER ----
-        buyers = sol_signers(ca) if d["chain"] == "solana" else []
-        organic, cluster = analyze_wallets(buyers)
-        trend = update_trend(ca, organic)
-        rug = rug_risk(cluster, organic, liq, mc)
-
-        # ---- TIER LOGIC (EXACT) ----
-        if p1 and p2 and p3 and p4:
-            tier = "🟢 Tier A (Confirmed)"
-            cls = "confirmed"
-        elif p1 and p2 and (p3 or p4):
-            tier = "🔵 Tier A (Early)"
-            cls = "early"
-        elif p1 and p2:
-            tier = "👀 Tier B"
-            cls = "b"
-        elif p3 or p4:
-            tier = "👀 Tier C"
-            cls = "c"
+        d = fetch_dex(row["ca"])
+        if not d:
+            outcome = "RUG"
+            mc_new = 0
         else:
-            tier = "❌ Tier D"
-            cls = "d"
+            mc_new = d["mc"]
+            ratio = mc_new / row["mc_at_scan"] if row["mc_at_scan"] else 0
 
-        prev_tier = LAST_TIER.get(ca)
-        alert = False
-        if prev_tier and prev_tier != tier:
-            alert = True
-            TIER_HISTORY.setdefault(ca, []).append({
-                "from": prev_tier,
-                "to": tier,
-                "time": datetime.datetime.now().strftime("%H:%M:%S")
-            })
-        LAST_TIER[ca] = tier
+            if ratio < 0.5:
+                outcome = "RUG"
+            elif ratio < 1.5:
+                outcome = "FLAT"
+            elif ratio < 5:
+                outcome = "2X_5X"
+            elif ratio < 20:
+                outcome = "5X_20X"
+            else:
+                outcome = "20X_PLUS"
 
-        conf = confidence(p1 and p2, p3, p4, organic, rug)
+        df.at[i, "mc_latest"] = mc_new
+        df.at[i, "outcome"] = outcome
+        df.at[i, "labeled_at"] = now.isoformat()
+        changed = True
 
-        results.append({
-            "ca": ca,
-            "name": d["name"],
-            "symbol": d["symbol"],
-            "mc": int(mc),
-            "liq": int(liq),
-            "lmc": lmc,
-            "bs": bs_ratio,
-            "acc": acc,
-            "tier": tier,
-            "cls": cls,
-            "organic": organic,
-            "trend": trend,
-            "cluster": cluster,
-            "rug": rug,
-            "conf": conf,
-            "chaos": mc <= CHAOS_MC_MAX and p3,
-            "alert": alert
-        })
+    if changed:
+        df.to_csv(DATA_FILE, index=False)
 
-    return render_template_string(HTML, results=results, cas=cas)
+# =====================================================
+# TRAIN ML (RUN BY CRON)
+# =====================================================
+def train_model():
+    df = pd.read_csv(DATA_FILE)
+    df = df.dropna(subset=["outcome"])
 
+    if len(df) < MIN_ROWS_TO_TRAIN:
+        return False
+
+    X = df[["lmc", "buys", "sells", "accel"]]
+    y = df["outcome"]
+
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=8,
+        min_samples_leaf=20,
+        random_state=42
+    )
+    model.fit(X, y)
+    joblib.dump(model, MODEL_FILE)
+    return True
+
+# =====================================================
+# CRON TASKS
+# =====================================================
+def cron_tasks():
+    print("CRON STARTED")
+    auto_label()
+    trained = train_model()
+    if trained:
+        print("MODEL TRAINED")
+    else:
+        print("NOT ENOUGH DATA")
+    print("CRON FINISHED")
+
+# =====================================================
+# WEB APP (VERY SIMPLE)
+# =====================================================
+HTML = """
+<h2>ML Scanner</h2>
+<form method="post">
+<textarea name="cas" style="width:100%;height:120px"></textarea><br>
+<button>Scan</button>
+</form>
+<pre>{{msg}}</pre>
+"""
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    msg = ""
+    if request.method == "POST":
+        cas = request.form.get("cas", "")
+        for ca in cas.splitlines():
+            ca = ca.strip()
+            if not ca:
+                continue
+            d = fetch_dex(ca)
+            if d:
+                save_snapshot(ca, d)
+                msg += f"Saved {ca}\n"
+    return render_template_string(HTML, msg=msg)
+
+# =====================================================
+# ENTRY POINT
+# =====================================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    if IS_CRON:
+        cron_tasks()
+    else:
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host="0.0.0.0", port=port)
