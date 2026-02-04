@@ -1,172 +1,207 @@
-import os, csv, time, datetime, requests
-import pandas as pd, joblib
+import os, io, csv, time, datetime, base64, requests
+import numpy as np
+import pandas as pd
 from flask import Flask, request, render_template_string
 from sklearn.ensemble import RandomForestClassifier
 from scipy.stats import spearmanr
 
-# ================= DISK LOCK =================
-DISK_PATH = "/data"
-if not os.path.exists(DISK_PATH):
-    raise RuntimeError("❌ Persistent disk not mounted at /data")
+# =====================================================
+# GITHUB CONFIG (FREE PERSISTENT STORAGE)
+# =====================================================
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO")
+GITHUB_FILE  = os.environ.get("GITHUB_FILE", "coin_data.csv")
 
-# ================= PATHS =================
-DATA_FILE = "/data/coin_data.csv"
-MODEL_FILE = "/data/ml_model.pkl"
-STATE_FILE = "/data/state.txt"
+if not GITHUB_TOKEN or not GITHUB_REPO:
+    raise RuntimeError("GitHub env vars missing")
 
-# ================= CONFIG =================
+GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+# =====================================================
+# CONFIG
+# =====================================================
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 LABEL_AFTER_DAYS = 3
-MIN_ROWS_TO_TRAIN = 50
+MIN_TRAIN_ROWS = 50
 
-# ================= CSV SCHEMA =================
+# =====================================================
+# FINAL CSV SCHEMA (LOCKED)
+# =====================================================
 CSV_HEADER = [
-    "timestamp","ca",
-    "mc_at_scan","liq","lmc",
-    "buys","sells","accel",
-    "age_minutes","tx_count_24h","rsi_15m",
-    "predicted_mc_dd",
-    "total_scanned_at_time","total_labeled_at_time",
-    "tier","mc_latest","outcome","labeled_at"
+    "timestamp","ca","symbol","chain",
+    "price","market_cap","liquidity",
+    "buys_5m","sells_5m","buys_1h","sells_1h",
+    "txns_24h",
+    "volume_5m","volume_1h","volume_24h",
+    "age_minutes",
+    "rsi_5m","rsi_15m",
+    "liq_to_mc","buy_sell_ratio",
+    "label_outcome","mc_after_3d",
+    "ml_predicted_mc","ml_confidence"
 ]
 
-# ================= SAFE CSV INIT =================
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w", newline="") as f:
-        csv.writer(f).writerow(CSV_HEADER)
-
+# =====================================================
+# APP
+# =====================================================
 app = Flask(__name__)
 
-# ================= STATUS =================
-def disk_status():
-    return "OK" if os.path.exists(DISK_PATH) else "MISSING"
+# =====================================================
+# GITHUB CSV HELPERS
+# =====================================================
+def load_csv():
+    r = requests.get(GITHUB_API, headers=HEADERS)
+    if r.status_code == 404:
+        return pd.DataFrame(columns=CSV_HEADER), None
+    data = r.json()
+    content = base64.b64decode(data["content"]).decode()
+    df = pd.read_csv(io.StringIO(content))
+    return df, data["sha"]
 
-def csv_status():
-    try:
-        with open(DATA_FILE, "r") as f:
-            reader = csv.reader(f)
-            header = next(reader)
-            rows = sum(1 for _ in reader)
-        return header == CSV_HEADER, rows
-    except:
-        return False, 0
+def save_csv(df, sha):
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    encoded = base64.b64encode(buf.getvalue().encode()).decode()
+    payload = {
+        "message": "update coin data",
+        "content": encoded,
+        "sha": sha
+    }
+    r = requests.put(GITHUB_API, headers=HEADERS, json=payload)
+    if r.status_code not in (200,201):
+        raise RuntimeError("GitHub CSV save failed")
 
-# ================= DATA =================
+# =====================================================
+# INDICATORS
+# =====================================================
+def rsi_from_buys_sells(buys, sells):
+    rs = buys / max(sells, 1)
+    return round(100 - (100 / (1 + rs)), 2)
+
+# =====================================================
+# FETCH DEX DATA
+# =====================================================
 def fetch_dex(ca):
-    try:
-        r = requests.get(DEX_URL + ca, timeout=10).json()
-        if not r.get("pairs"):
-            return None
-        p = r["pairs"][0]
-        created = p.get("pairCreatedAt", int(time.time()*1000))
-        age = int((time.time()*1000 - created) / 60000)
-        tx = p.get("txns", {}).get("h24", {})
-        buys, sells = tx.get("buys",0), tx.get("sells",0)
-        return {
-            "symbol": p["baseToken"]["symbol"],
-            "mc": float(p.get("fdv") or 0),
-            "liq": float(p.get("liquidity",{}).get("usd") or 0),
-            "buys": buys,
-            "sells": sells,
-            "tx": buys + sells,
-            "age": age
-        }
-    except:
+    r = requests.get(DEX_URL + ca, timeout=10).json()
+    if not r.get("pairs"):
         return None
 
-def rsi(buys,sells):
-    rs = buys / max(sells,1)
-    return round(100 - (100/(1+rs)),2)
+    p = r["pairs"][0]
+    tx5 = p.get("txns", {}).get("m5", {})
+    tx1h = p.get("txns", {}).get("h1", {})
+    tx24 = p.get("txns", {}).get("h24", {})
+    vol = p.get("volume", {})
 
-# ================= ML =================
-MULT = {"RUG":0.2,"FLAT":1.0,"2X_5X":3.5,"5X_20X":10,"20X_PLUS":30}
-RUG_PENALTY = 2.5
+    created = p.get("pairCreatedAt", int(time.time()*1000))
+    age = int((time.time()*1000 - created) / 60000)
 
-def ml_predict(mc,lmc,buys,sells,accel,age,tx,rsi_v):
-    if not os.path.exists(MODEL_FILE):
-        return None, mc, 0
-    m = joblib.load(MODEL_FILE)
-    probs = dict(zip(
-        m.classes_,
-        m.predict_proba([[lmc,buys,sells,accel,age,tx,rsi_v]])[0]
-    ))
-    ev = sum(probs[k]*MULT[k] for k in probs)
-    score = ev - probs.get("RUG",0)*RUG_PENALTY
-    return probs, int(mc*ev), round(score,2)
+    return {
+        "symbol": p["baseToken"]["symbol"],
+        "chain": p["chainId"],
+        "price": float(p.get("priceUsd") or 0),
+        "mc": float(p.get("fdv") or 0),
+        "liq": float(p.get("liquidity",{}).get("usd") or 0),
+        "buys5": tx5.get("buys",0),
+        "sells5": tx5.get("sells",0),
+        "buys1h": tx1h.get("buys",0),
+        "sells1h": tx1h.get("sells",0),
+        "tx24": tx24.get("buys",0) + tx24.get("sells",0),
+        "vol5": float(vol.get("m5",0)),
+        "vol1h": float(vol.get("h1",0)),
+        "vol24": float(vol.get("h24",0)),
+        "age": age
+    }
 
-# ================= STATS =================
-def stats():
-    df = pd.read_csv(DATA_FILE)
-    scanned = max(len(df) - 1, 0)     # <-- FIXED
-    labeled = df["outcome"].notna().sum()
-    return scanned, labeled
-
-# ================= SAVE =================
-def save_snapshot(ca,d,pmc):
-    df = pd.read_csv(DATA_FILE)
-    scanned, labeled = stats()
-    lmc = (d["liq"]/d["mc"])*100 if d["mc"] else 0
-    accel = d["buys"]
-    with open(DATA_FILE,"a",newline="") as f:
-        csv.writer(f).writerow([
-            datetime.datetime.utcnow().isoformat(),
-            ca,
-            d["mc"], d["liq"], round(lmc,2),
-            d["buys"], d["sells"], accel,
-            d["age"], d["tx"], rsi(d["buys"],d["sells"]),
-            pmc,
-            scanned, labeled,
-            "NA","","",""
-        ])
-
-# ================= LABEL + TRAIN =================
-def auto_label():
-    df = pd.read_csv(DATA_FILE)
+# =====================================================
+# AUTO LABEL
+# =====================================================
+def auto_label(df):
     now = datetime.datetime.utcnow()
     for i,r in df.iterrows():
-        if pd.notna(r["outcome"]): continue
-        if (now-datetime.datetime.fromisoformat(r["timestamp"])).days < LABEL_AFTER_DAYS:
+        if pd.notna(r["label_outcome"]):
             continue
+        t = datetime.datetime.fromisoformat(r["timestamp"])
+        if (now - t).days < LABEL_AFTER_DAYS:
+            continue
+
         d = fetch_dex(r["ca"])
         mc2 = d["mc"] if d else 0
-        ratio = mc2/r["mc_at_scan"] if r["mc_at_scan"] else 0
-        out = "RUG" if ratio<0.5 else "FLAT" if ratio<1.5 else "2X_5X" if ratio<5 else "5X_20X" if ratio<20 else "20X_PLUS"
-        df.at[i,"mc_latest"]=mc2
-        df.at[i,"outcome"]=out
-        df.at[i,"labeled_at"]=now.isoformat()
-    df.to_csv(DATA_FILE,index=False)
+        ratio = mc2 / r["market_cap"] if r["market_cap"] else 0
 
-def train():
-    df = pd.read_csv(DATA_FILE).dropna(subset=["outcome"])
-    if len(df) < MIN_ROWS_TO_TRAIN: return
-    X = df[["lmc","buys","sells","accel","age_minutes","tx_count_24h","rsi_15m"]]
-    y = df["outcome"]
-    model = RandomForestClassifier(n_estimators=300,max_depth=10,min_samples_leaf=15)
+        if ratio < 0.5:
+            out = "RUG"
+        elif ratio < 1.5:
+            out = "FLAT"
+        elif ratio < 5:
+            out = "2X"
+        elif ratio < 20:
+            out = "5X"
+        else:
+            out = "20X"
+
+        df.at[i,"label_outcome"] = out
+        df.at[i,"mc_after_3d"] = mc2
+
+    return df
+
+# =====================================================
+# ML TRAIN / PREDICT
+# =====================================================
+MODEL_PATH = "ml_model.pkl"
+
+def train_ml(df):
+    train_df = df.dropna(subset=["label_outcome"])
+    if len(train_df) < MIN_TRAIN_ROWS:
+        return None
+
+    X = train_df[[
+        "liq_to_mc","buy_sell_ratio",
+        "buys_5m","buys_1h",
+        "volume_5m","volume_1h",
+        "age_minutes","rsi_5m","rsi_15m"
+    ]]
+    y = train_df["label_outcome"]
+
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_leaf=10,
+        random_state=42
+    )
     model.fit(X,y)
-    joblib.dump(model,MODEL_FILE)
+    return model
 
-def lazy():
-    today = datetime.date.today().isoformat()
-    if os.path.exists(STATE_FILE) and open(STATE_FILE).read().strip() == today:
-        return
-    auto_label()
-    train()
-    open(STATE_FILE,"w").write(today)
+MULT = {"RUG":0.2,"FLAT":1,"2X":3,"5X":10,"20X":30}
 
-# ================= UI =================
+def ml_predict(model, row):
+    if model is None:
+        return row["market_cap"], 0
+
+    X = [[
+        row["liq_to_mc"],row["buy_sell_ratio"],
+        row["buys_5m"],row["buys_1h"],
+        row["volume_5m"],row["volume_1h"],
+        row["age_minutes"],row["rsi_5m"],row["rsi_15m"]
+    ]]
+    probs = dict(zip(model.classes_, model.predict_proba(X)[0]))
+    ev = sum(probs[k]*MULT[k] for k in probs)
+    return int(row["market_cap"] * ev), round(ev,2)
+
+# =====================================================
+# UI
+# =====================================================
 HTML = """
 <meta http-equiv="refresh" content="15">
-<h2>ML Scanner</h2>
+<h2>📱 Meme Trading Tool (Free)</h2>
 
 <p>
-🧠 Disk: <b>{{disk}}</b> |
-📄 CSV Rows: <b>{{rows}}</b> |
-📑 Header: <b>{{header}}</b>
+📦 Storage: GitHub |
+📄 Total Scanned: <b>{{sc}}</b> |
+🏷 Labeled: <b>{{lb}}</b>
 </p>
-
-<a href="/backtest"><button>📊 Backtest</button></a>
-
-<p><b>Scanned:</b> {{sc}} | <b>Labeled:</b> {{lb}}</p>
 
 <form method="post">
 <textarea name="cas" style="width:100%;height:120px;">{{cas}}</textarea><br>
@@ -176,17 +211,23 @@ HTML = """
 {% if results %}
 <hr>
 {% for r in results %}
-<b>{{r.symbol}}</b> | MC ${{r.mc}} | Pred MC ${{r.pmc}} | Size {{r.size}}%<br>
-{{r.ml}}<br><br>
+<b>{{r.symbol}}</b> ({{r.chain}})<br>
+MC: ${{r.mc}} | Liq: ${{r.liq}} | Age: {{r.age}}m<br>
+RSI(5m): {{r.rsi5}} | RSI(15m): {{r.rsi15}}<br>
+Pred MC: ${{r.pmc}} | Confidence: {{r.conf}}<br>
+<hr>
 {% endfor %}
 {% endif %}
+
+<p><a href="/backtest">📊 Backtest</a></p>
 """
 
 @app.route("/", methods=["GET","POST"])
 def index():
-    lazy()
-    sc, lb = stats()
-    header_ok, rows = csv_status()
+    df, sha = load_csv()
+    df = auto_label(df)
+    model = train_ml(df)
+
     results = []
     cas_text = ""
 
@@ -195,47 +236,76 @@ def index():
         for ca in cas_text.splitlines():
             d = fetch_dex(ca.strip())
             if not d: continue
-            lmc = (d["liq"]/d["mc"])*100 if d["mc"] else 0
-            probs, pmc, score = ml_predict(
-                d["mc"], lmc, d["buys"], d["sells"],
-                d["buys"], d["age"], d["tx"], rsi(d["buys"],d["sells"])
-            )
-            if probs:
-                size = min(int(score*10),5)
-                ml_txt = ", ".join(f"{k}:{int(v*100)}%" for k,v in probs.items())
-            else:
-                size = 0
-                ml_txt = "ML collecting data"
-            save_snapshot(ca,d,pmc)
+
+            rsi5 = rsi_from_buys_sells(d["buys5"], d["sells5"])
+            rsi15 = rsi_from_buys_sells(d["buys1h"], d["sells1h"])
+
+            row = {
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "ca": ca,
+                "symbol": d["symbol"],
+                "chain": d["chain"],
+                "price": d["price"],
+                "market_cap": d["mc"],
+                "liquidity": d["liq"],
+                "buys_5m": d["buys5"],
+                "sells_5m": d["sells5"],
+                "buys_1h": d["buys1h"],
+                "sells_1h": d["sells1h"],
+                "txns_24h": d["tx24"],
+                "volume_5m": d["vol5"],
+                "volume_1h": d["vol1h"],
+                "volume_24h": d["vol24"],
+                "age_minutes": d["age"],
+                "rsi_5m": rsi5,
+                "rsi_15m": rsi15,
+                "liq_to_mc": round((d["liq"]/d["mc"])*100 if d["mc"] else 0,2),
+                "buy_sell_ratio": round(d["buys1h"]/max(d["sells1h"],1),2),
+                "label_outcome": "",
+                "mc_after_3d": "",
+                "ml_predicted_mc": "",
+                "ml_confidence": ""
+            }
+
+            pmc, conf = ml_predict(model, row)
+            row["ml_predicted_mc"] = pmc
+            row["ml_confidence"] = conf
+
+            df.loc[len(df)] = row
+
             results.append({
                 "symbol": d["symbol"],
+                "chain": d["chain"],
                 "mc": int(d["mc"]),
+                "liq": int(d["liq"]),
+                "age": d["age"],
+                "rsi5": rsi5,
+                "rsi15": rsi15,
                 "pmc": pmc,
-                "size": size,
-                "ml": ml_txt
+                "conf": conf
             })
+
+        save_csv(df, sha)
 
     return render_template_string(
         HTML,
-        disk=disk_status(),
-        rows=rows,
-        header="OK" if header_ok else "INVALID",
-        sc=sc, lb=lb,
+        sc=len(df),
+        lb=df["label_outcome"].notna().sum(),
         results=results,
         cas=cas_text
     )
 
 @app.route("/backtest")
 def backtest():
-    df = pd.read_csv(DATA_FILE).dropna(subset=["predicted_mc_dd","mc_latest"])
-    if len(df) < 30:
-        return "Not enough data"
-    corr,_ = spearmanr(df["predicted_mc_dd"], df["mc_latest"])
-    df["err"] = df["mc_latest"]/df["predicted_mc_dd"]
+    df, _ = load_csv()
+    bt = df.dropna(subset=["mc_after_3d","ml_predicted_mc"])
+    if len(bt) < 20:
+        return "Not enough data for backtest yet"
+    corr,_ = spearmanr(bt["ml_predicted_mc"], bt["mc_after_3d"])
     return f"""
     <h2>Backtest</h2>
+    Samples: {len(bt)}<br>
     Correlation: {round(corr,3)}<br>
-    Median Error: {round(df["err"].median(),2)}<br>
     <a href="/">Back</a>
     """
 
