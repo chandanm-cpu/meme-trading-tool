@@ -1,5 +1,5 @@
 import os, csv, time, datetime, requests
-import pandas as pd, joblib, numpy as np
+import pandas as pd, joblib
 from flask import Flask, request, render_template_string
 from sklearn.ensemble import RandomForestClassifier
 from scipy.stats import spearmanr
@@ -146,55 +146,76 @@ def lazy():
     open(STATE_FILE,"w").write(t)
 
 # ---------------- UI ----------------
-@app.route("/")
+HTML = """
+<meta http-equiv="refresh" content="15">
+<h2>ML Scanner</h2>
+
+<div style="margin-bottom:10px;">
+  <a href="/backtest"><button style="padding:8px 16px;">📊 Backtest</button></a>
+</div>
+
+<p>Scanned: {{sc}} | Labeled: {{lb}} | Regime: {{reg}}</p>
+
+<form method="post">
+<textarea name="cas" style="width:100%;height:120px;">{{cas}}</textarea><br>
+<button style="padding:14px 28px;font-size:18px;">🚀 Scan</button>
+</form>
+
+{% if results %}
+<hr>
+<h3>Results</h3>
+{% for r in results %}
+<div style="margin-bottom:12px;">
+<b>{{r.symbol}}</b> | MC ${{r.mc}} | Pred MC ${{r.pmc}} | Size {{r.size}}%<br>
+{{r.ml}}
+</div>
+{% endfor %}
+{% endif %}
+"""
+
+@app.route("/", methods=["GET","POST"])
 def index():
     lazy()
     sc,lb = stats()
-    regime,_ = market_regime()
-    return render_template_string("""
-    <meta http-equiv="refresh" content="15">
-    <h2>ML Scanner</h2>
-    <p>Scanned: {{sc}} | Labeled: {{lb}} | Regime: {{reg}}</p>
-    <form method="post" action="/scan">
-      <textarea name="cas" style="width:100%;height:120px"></textarea><br>
-      <button>Scan</button>
-    </form>
-    <p><a href="/backtest">Backtest</a></p>
-    """, sc=sc, lb=lb, reg=regime)
-
-@app.route("/scan", methods=["POST"])
-def scan():
-    lazy()
     regime, reg_mult = market_regime()
-    out = []
+    results = []
+    cas_text = ""
 
-    for ca in request.form.get("cas","").splitlines():
-        d = fetch_dex(ca.strip())
-        if not d:
-            continue
+    if request.method == "POST":
+        cas_text = request.form.get("cas","")
+        for ca in cas_text.splitlines():
+            d = fetch_dex(ca.strip())
+            if not d:
+                continue
+            lmc = (d["liq"]/d["mc"])*100 if d["mc"] else 0
+            probs, pmc, score = ml_predict(
+                d["mc"], lmc, d["buys"], d["sells"],
+                d["buys"], d["age"], d["tx"], rsi(d["buys"],d["sells"])
+            )
 
-        lmc = (d["liq"]/d["mc"])*100 if d["mc"] else 0
-        probs, pmc, score = ml_predict(
-            d["mc"], lmc, d["buys"], d["sells"],
-            d["buys"], d["age"], d["tx"], rsi(d["buys"],d["sells"])
-        )
+            if probs:
+                size = int(position_size(score, probs.get("RUG",0), reg_mult)*100)
+                ml_txt = ", ".join(f"{k}:{int(v*100)}%" for k,v in probs.items())
+            else:
+                size = 0
+                ml_txt = "ML collecting data"
 
-        if probs:
-            size = position_size(score, probs.get("RUG",0), reg_mult)
-            ml_txt = ", ".join(f"{k}:{int(v*100)}%" for k,v in probs.items())
-        else:
-            size = 0.0
-            ml_txt = "ML collecting data"
+            save(ca, d, pmc)
 
-        save(ca, d, pmc)
+            results.append({
+                "symbol": d["symbol"],
+                "mc": int(d["mc"]),
+                "pmc": pmc,
+                "size": size,
+                "ml": ml_txt
+            })
 
-        out.append(
-            f"<b>{d['symbol']}</b> | MC ${int(d['mc'])} | "
-            f"Pred MC ${pmc} | Size {int(size*100)}%<br>"
-            f"{ml_txt}<br>"
-        )
-
-    return "<hr>".join(out) + '<br><a href="/">Back</a>'
+    return render_template_string(
+        HTML,
+        sc=sc, lb=lb, reg=regime,
+        results=results,
+        cas=cas_text
+    )
 
 @app.route("/backtest")
 def backtest():
