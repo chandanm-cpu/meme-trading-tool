@@ -28,10 +28,11 @@ if not os.path.exists(DATA_FILE):
     with open(DATA_FILE,"w",newline="") as f:
         csv.writer(f).writerow(CSV_HEADER)
 
-# ---------- DATA ----------
+# ---------------- DATA ----------------
 def fetch_dex(ca):
     r = requests.get(DEX_URL + ca, timeout=10).json()
-    if not r.get("pairs"): return None
+    if not r.get("pairs"):
+        return None
     p = r["pairs"][0]
     created = p.get("pairCreatedAt", int(time.time()*1000))
     age = int((time.time()*1000 - created) / 60000)
@@ -52,9 +53,9 @@ def rsi(buys,sells):
     rs = buys / max(sells,1)
     return round(100 - (100/(1+rs)),2)
 
-# ---------- ML ----------
+# ---------------- ML ----------------
 MULT = {"RUG":0.2,"FLAT":1.0,"2X_5X":3.5,"5X_20X":10,"20X_PLUS":30}
-RUG_PENALTY = 2.5  # asymmetric loss
+RUG_PENALTY = 2.5
 
 def ml_predict(mc,lmc,buys,sells,accel,age,tx,rsi_v):
     if not os.path.exists(MODEL_FILE):
@@ -65,25 +66,28 @@ def ml_predict(mc,lmc,buys,sells,accel,age,tx,rsi_v):
         m.predict_proba([[lmc,buys,sells,accel,age,tx,rsi_v]])[0]
     ))
     ev = sum(probs[k]*MULT[k] for k in probs)
-    risk_adj_score = ev - (probs.get("RUG",0)*RUG_PENALTY)
-    return probs, int(mc*ev), round(risk_adj_score,2)
+    score = ev - probs.get("RUG",0)*RUG_PENALTY
+    return probs, int(mc*ev), round(score,2)
 
-# ---------- MARKET REGIME ----------
+# ---------------- REGIME ----------------
 def market_regime():
     df = pd.read_csv(DATA_FILE).dropna(subset=["outcome"])
-    if len(df) < 50: return "NEUTRAL", 0.7
+    if len(df) < 50:
+        return "NEUTRAL", 0.7
     rug_rate = (df["outcome"]=="RUG").mean()
-    if rug_rate > 0.45: return "TOXIC", 0.3
-    if rug_rate < 0.25: return "HOT", 1.0
+    if rug_rate > 0.45:
+        return "TOXIC", 0.3
+    if rug_rate < 0.25:
+        return "HOT", 1.0
     return "NEUTRAL", 0.7
 
-# ---------- POSITION SIZING ----------
-def position_size(score, rug_p, regime_mult):
-    if rug_p > 0.4 or score <= 0: return 0.0
-    base = min(score/10, 0.05)  # cap at 5%
-    return round(base * regime_mult, 3)
+def position_size(score, rug_p, reg_mult):
+    if rug_p > 0.4 or score <= 0:
+        return 0.0
+    base = min(score/10, 0.05)
+    return round(base * reg_mult, 3)
 
-# ---------- STORAGE ----------
+# ---------------- STORAGE ----------------
 def stats():
     df = pd.read_csv(DATA_FILE)
     return len(df), df["outcome"].notna().sum()
@@ -105,26 +109,28 @@ def save(ca,d,pmc):
             "NA","","",""
         ])
 
-# ---------- LABEL + TRAIN ----------
+# ---------------- LABEL + TRAIN ----------------
 def auto_label():
     df = pd.read_csv(DATA_FILE)
     now = datetime.datetime.utcnow()
     for i,r in df.iterrows():
-        if pd.notna(r["outcome"]): continue
+        if pd.notna(r["outcome"]):
+            continue
         if (now-datetime.datetime.fromisoformat(r["timestamp"])).days < LABEL_AFTER_DAYS:
             continue
         d = fetch_dex(r["ca"])
         mc2 = d["mc"] if d else 0
         ratio = mc2/r["mc_at_scan"] if r["mc_at_scan"] else 0
         out = "RUG" if ratio<0.5 else "FLAT" if ratio<1.5 else "2X_5X" if ratio<5 else "5X_20X" if ratio<20 else "20X_PLUS"
-        df.at[i,"mc_latest"]=mc2
-        df.at[i,"outcome"]=out
-        df.at[i,"labeled_at"]=now.isoformat()
+        df.at[i,"mc_latest"] = mc2
+        df.at[i,"outcome"] = out
+        df.at[i,"labeled_at"] = now.isoformat()
     df.to_csv(DATA_FILE,index=False)
 
 def train():
     df = pd.read_csv(DATA_FILE).dropna(subset=["outcome"])
-    if len(df) < MIN_ROWS_TO_TRAIN: return
+    if len(df) < MIN_ROWS_TO_TRAIN:
+        return
     X = df[["lmc","buys","sells","accel","age_minutes","tx_count_24h","rsi_15m"]]
     y = df["outcome"]
     m = RandomForestClassifier(n_estimators=300,max_depth=10,min_samples_leaf=15)
@@ -133,16 +139,18 @@ def train():
 
 def lazy():
     t = datetime.date.today().isoformat()
-    if os.path.exists(STATE_FILE) and open(STATE_FILE).read().strip()==t: return
-    auto_label(); train()
+    if os.path.exists(STATE_FILE) and open(STATE_FILE).read().strip()==t:
+        return
+    auto_label()
+    train()
     open(STATE_FILE,"w").write(t)
 
-# ---------- UI ----------
+# ---------------- UI ----------------
 @app.route("/")
 def index():
     lazy()
     sc,lb = stats()
-    regime, mult = market_regime()
+    regime,_ = market_regime()
     return render_template_string("""
     <meta http-equiv="refresh" content="15">
     <h2>ML Scanner</h2>
@@ -158,24 +166,43 @@ def index():
 def scan():
     lazy()
     regime, reg_mult = market_regime()
-    out=[]
+    out = []
+
     for ca in request.form.get("cas","").splitlines():
         d = fetch_dex(ca.strip())
-        if not d: continue
+        if not d:
+            continue
+
         lmc = (d["liq"]/d["mc"])*100 if d["mc"] else 0
-        probs, pmc, score = ml_predict(d["mc"],lmc,d["buys"],d["sells"],d["buys"],d["age"],d["tx"],rsi(d["buys"],d["sells"]))
+        probs, pmc, score = ml_predict(
+            d["mc"], lmc, d["buys"], d["sells"],
+            d["buys"], d["age"], d["tx"], rsi(d["buys"],d["sells"])
+        )
+
         if probs:
             size = position_size(score, probs.get("RUG",0), reg_mult)
-            save(ca,d,pmc)
-            out.append(f"{d['symbol']} | MC ${int(d['mc'])} | Pred MC ${pmc} | Score {score} | Size {int(size*100)}%")
-    return "<br>".join(out) + '<br><a href="/">Back</a>'
+            ml_txt = ", ".join(f"{k}:{int(v*100)}%" for k,v in probs.items())
+        else:
+            size = 0.0
+            ml_txt = "ML collecting data"
+
+        save(ca, d, pmc)
+
+        out.append(
+            f"<b>{d['symbol']}</b> | MC ${int(d['mc'])} | "
+            f"Pred MC ${pmc} | Size {int(size*100)}%<br>"
+            f"{ml_txt}<br>"
+        )
+
+    return "<hr>".join(out) + '<br><a href="/">Back</a>'
 
 @app.route("/backtest")
 def backtest():
     df = pd.read_csv(DATA_FILE).dropna(subset=["predicted_mc_dd","mc_latest"])
-    if len(df)<30: return "Not enough data"
-    corr,_ = spearmanr(df["predicted_mc_dd"],df["mc_latest"])
-    df["err"]=df["mc_latest"]/df["predicted_mc_dd"]
+    if len(df) < 30:
+        return "Not enough data"
+    corr,_ = spearmanr(df["predicted_mc_dd"], df["mc_latest"])
+    df["err"] = df["mc_latest"]/df["predicted_mc_dd"]
     return f"""
     <h2>Backtest</h2>
     Correlation: {round(corr,3)}<br>
@@ -184,4 +211,4 @@ def backtest():
     """
 
 if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
