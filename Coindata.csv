@@ -1,0 +1,1 @@
+timestamp,ca,symbol,chain,price,market_cap,liquidity,buys_5m,sells_5m,buys_1h,sells_1h,txns_24h,volume_5m,volume_1h,volume_24h,age_minutes,rsi_5m,rsi_15m,liq_to_mc,buy_sell_ratio,label_outcome,mc_after_3d,ml_predicted_mc,ml_confidence
