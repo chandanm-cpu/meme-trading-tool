@@ -1,2 +1,3 @@
 timestamp,ca,symbol,chain,price,market_cap,liquidity,buys_5m,sells_5m,buys_1h,sells_1h,txns_24h,volume_5m,volume_1h,volume_24h,age_minutes,rsi_5m,rsi_15m,liq_to_mc,buy_sell_ratio,label_outcome,mc_after_3d,ml_predicted_mc,ml_confidence
 2026-02-05T04:55:25.485560,EKwF2HD6X4rHHr4322EJeK9QBGkqhpHZQSanSUmWkecG,BigTrout,solana,0.004601,4601240.0,201755.7,793,831,5790,5425,66449,220532.15,1465584.58,6604353.47,400,48.83,51.63,4.38,1.07,,,4601240.0,0
+2026-02-05T04:55:52.517397,EgDNyj8t7F3Cox2fv6rkZnpfTs432PUzozhTErjuSYh5,Adog,solana,1.111e-05,11119.0,8461.61,429,453,429,453,882,36228.57,36228.57,36228.57,4,48.64,48.64,76.1,0.95,,,11119.0,0
