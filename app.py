@@ -22,7 +22,7 @@ HEADERS = {
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 MIN_TRAIN_ROWS = 50
 
-# ===================== CSV HEADER (LOCKED) =====================
+# ===================== CSV HEADER (LOCKED – DO NOT CHANGE) =====================
 CSV_HEADER = [
     "timestamp","ca","symbol","chain",
     "price","market_cap","liquidity",
@@ -69,64 +69,51 @@ def fetch_dex(ca):
     tx24 = p.get("txns", {}).get("h24", {})
     vol = p.get("volume", {})
 
-    created = p.get("pairCreatedAt", int(time.time() * 1000))
-    age = int((time.time() * 1000 - created) / 60000)
+    created = p.get("pairCreatedAt", int(time.time()*1000))
+    age = int((time.time()*1000 - created) / 60000)
 
     return {
         "symbol": p["baseToken"]["symbol"],
         "chain": p["chainId"],
         "price": float(p.get("priceUsd") or 0),
         "mc": float(p.get("fdv") or 0),
-        "liq": float(p.get("liquidity", {}).get("usd") or 0),
-        "buys5": tx5.get("buys", 0),
-        "sells5": tx5.get("sells", 0),
-        "buys1h": tx1h.get("buys", 0),
-        "sells1h": tx1h.get("sells", 0),
-        "tx24": tx24.get("buys", 0) + tx24.get("sells", 0),
-        "vol5": float(vol.get("m5", 0)),
-        "vol1h": float(vol.get("h1", 0)),
-        "vol24": float(vol.get("h24", 0)),
+        "liq": float(p.get("liquidity",{}).get("usd") or 0),
+        "buys5": tx5.get("buys",0),
+        "sells5": tx5.get("sells",0),
+        "buys1h": tx1h.get("buys",0),
+        "sells1h": tx1h.get("sells",0),
+        "tx24": tx24.get("buys",0)+tx24.get("sells",0),
+        "vol5": float(vol.get("m5",0)),
+        "vol1h": float(vol.get("h1",0)),
+        "vol24": float(vol.get("h24",0)),
         "age": age
     }
 
-# ===================== ORACLE SCORES =====================
+# ===================== ORACLE / PROXY SCORES =====================
 def insider_proxy(d):
     score = 0
-    if d["buys1h"] > d["sells1h"] * 2:
-        score += 35
-    if d["liq"] > d["mc"] * 0.08:
-        score += 35
-    if d["age"] < 120:
-        score += 20
-    return min(score, 100)
+    if d["buys1h"] > d["sells1h"]*2: score += 35
+    if d["liq"] > d["mc"]*0.08: score += 35
+    if d["age"] < 120: score += 20
+    return min(score,100)
 
 def narrative_proxy(d):
     score = 0
-    if d["vol1h"] > d["vol5"] * 2:
-        score += 35
-    if d["tx24"] > 100:
-        score += 35
-    if 40 < rsi(d["buys5"], d["sells5"]) < 70:
-        score += 20
-    return min(score, 100)
+    if d["vol1h"] > d["vol5"]*2: score += 35
+    if d["tx24"] > 100: score += 35
+    if 40 < rsi(d["buys5"],d["sells5"]) < 70: score += 20
+    return min(score,100)
 
 # ===================== ML =====================
 MULT = {
-    "RUG": 0.2,
-    "FLAT": 1,
-    "2X": 3,
-    "5X": 7,
-    "10X": 15,
-    "20X": 30,
-    "50X": 60,
-    "100X": 120
+    "RUG":0.2,"FLAT":1,"2X":3,"5X":7,
+    "10X":15,"20X":30,"50X":60,"100X":120
 }
 
 def train_ml(df):
     df = df.dropna(subset=["label_outcome"])
     if len(df) < MIN_TRAIN_ROWS:
         return None
-
     X = df[[
         "liq_to_mc","buy_sell_ratio",
         "buys_5m","buys_1h",
@@ -134,32 +121,31 @@ def train_ml(df):
         "age_minutes","rsi_5m","rsi_15m"
     ]]
     y = df["label_outcome"]
-
-    model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=10,
-        min_samples_leaf=10,
-        random_state=42
+    m = RandomForestClassifier(
+        n_estimators=300,max_depth=10,min_samples_leaf=10,random_state=42
     )
-    model.fit(X, y)
-    return model
+    m.fit(X,y)
+    return m
 
-def ml_predict(model, row):
-    if model is None:
+def ml_predict(m, row):
+    if m is None:
         return {}, row["market_cap"], 0
-
     X = [[
-        row["liq_to_mc"], row["buy_sell_ratio"],
-        row["buys_5m"], row["buys_1h"],
-        row["volume_5m"], row["volume_1h"],
-        row["age_minutes"], row["rsi_5m"], row["rsi_15m"]
+        row["liq_to_mc"],row["buy_sell_ratio"],
+        row["buys_5m"],row["buys_1h"],
+        row["volume_5m"],row["volume_1h"],
+        row["age_minutes"],row["rsi_5m"],row["rsi_15m"]
     ]]
+    probs = dict(zip(m.classes_, m.predict_proba(X)[0]))
+    ev = sum(probs[k]*MULT[k] for k in probs)
+    conf = min(100,int(ev*6))
+    return probs, int(row["market_cap"]*ev), conf
 
-    probs = dict(zip(model.classes_, model.predict_proba(X)[0]))
-    ev = sum(probs[k] * MULT[k] for k in probs)
-    confidence = min(100, int(ev * 6))
-
-    return probs, int(row["market_cap"] * ev), confidence
+# ===================== READINESS METER =====================
+def ml_readiness(df):
+    labeled = df["label_outcome"].notna().sum()
+    readiness = min(100, int((labeled / MIN_TRAIN_ROWS) * 100))
+    return labeled, readiness
 
 # ===================== UI =====================
 HTML = """
@@ -167,12 +153,13 @@ HTML = """
 
 <h2>
 📱 Meme Trading Tool
-&nbsp;&nbsp;
-<a href="/backtest">📊 Backtest</a>
+&nbsp;&nbsp;<a href="/backtest">📊 Backtest</a>
 </h2>
 
 <p>
-Scanned: <b>{{sc}}</b> | Labeled: <b>{{lb}}</b>
+Scanned: <b>{{sc}}</b> |
+Labeled: <b>{{lb}}</b> |
+🧠 ML Readiness: <b>{{ready}}%</b>
 </p>
 
 <form method="post">
@@ -180,15 +167,46 @@ Scanned: <b>{{sc}}</b> | Labeled: <b>{{lb}}</b>
 <button style="padding:14px 28px;font-size:18px;">🚀 Scan</button>
 </form>
 
+{% if alerts %}
+<hr>
+<h3>⚠️ Alerts</h3>
+<ul>
+{% for a in alerts %}
+<li>{{a}}</li>
+{% endfor %}
+</ul>
+{% endif %}
+
+{% if ranking %}
+<hr>
+<h3>🏆 Ranking Table</h3>
+<table border="1" cellpadding="6">
+<tr>
+<th>#</th><th>Coin</th><th>Current MC</th><th>Pred MC</th>
+<th>ML Conf</th><th>Insider</th><th>Narrative</th>
+</tr>
+{% for r in ranking %}
+<tr>
+<td>{{loop.index}}</td>
+<td>{{r.symbol}}</td>
+<td>${{r.mc}}</td>
+<td>${{r.pmc}}</td>
+<td>{{r.conf}}</td>
+<td>{{r.ins}}</td>
+<td>{{r.nar}}</td>
+</tr>
+{% endfor %}
+</table>
+{% endif %}
+
 {% if results %}
 <hr>
+<h3>🔍 Scan Results</h3>
 {% for r in results %}
 <b>{{r.symbol}}</b> ({{r.chain}})<br>
-Pred MC: ${{r.pmc}} | ML Confidence: {{r.conf}} / 100<br>
-
-Insider Proxy: {{r.ins}} / 100<br>
-Narrative Readiness: {{r.nar}} / 100<br>
-
+Current MC: ${{r.mc}} | Pred MC: ${{r.pmc}} | Liquidity: ${{r.liq}}<br>
+ML Conf: {{r.conf}} / 100<br>
+Insider: {{r.ins}} | Narrative: {{r.nar}}<br>
 Rug {{r.p.get("RUG",0)}}% |
 1–2x {{r.p.get("FLAT",0)}}% |
 5–10x {{r.p.get("5X",0)}}% |
@@ -204,67 +222,68 @@ Rug {{r.p.get("RUG",0)}}% |
 def index():
     df, sha = load_csv()
     model = train_ml(df)
+    labeled, readiness = ml_readiness(df)
 
-    results = []
+    results, ranking, alerts = [], [], []
     cas_text = ""
 
     if request.method == "POST":
         cas_text = request.form.get("cas","")
         for ca in cas_text.splitlines():
             d = fetch_dex(ca.strip())
-            if not d:
-                continue
+            if not d: continue
 
             row = {
                 "timestamp": datetime.datetime.utcnow().isoformat(),
-                "ca": ca,
-                "symbol": d["symbol"],
-                "chain": d["chain"],
-                "price": d["price"],
-                "market_cap": d["mc"],
-                "liquidity": d["liq"],
-                "buys_5m": d["buys5"],
-                "sells_5m": d["sells5"],
-                "buys_1h": d["buys1h"],
-                "sells_1h": d["sells1h"],
+                "ca": ca,"symbol": d["symbol"],"chain": d["chain"],
+                "price": d["price"],"market_cap": d["mc"],"liquidity": d["liq"],
+                "buys_5m": d["buys5"],"sells_5m": d["sells5"],
+                "buys_1h": d["buys1h"],"sells_1h": d["sells1h"],
                 "txns_24h": d["tx24"],
-                "volume_5m": d["vol5"],
-                "volume_1h": d["vol1h"],
-                "volume_24h": d["vol24"],
+                "volume_5m": d["vol5"],"volume_1h": d["vol1h"],"volume_24h": d["vol24"],
                 "age_minutes": d["age"],
-                "rsi_5m": rsi(d["buys5"], d["sells5"]),
-                "rsi_15m": rsi(d["buys1h"], d["sells1h"]),
+                "rsi_5m": rsi(d["buys5"],d["sells5"]),
+                "rsi_15m": rsi(d["buys1h"],d["sells1h"]),
                 "liq_to_mc": d["liq"]/d["mc"]*100 if d["mc"] else 0,
                 "buy_sell_ratio": d["buys1h"]/max(d["sells1h"],1),
-                "label_outcome": "",
-                "mc_after_3d": "",
-                "ml_predicted_mc": "",
-                "ml_confidence": ""
+                "label_outcome":"","mc_after_3d":"",
+                "ml_predicted_mc":"","ml_confidence":""
             }
 
-            probs, pmc, conf = ml_predict(model, row)
+            probs, pmc, conf = ml_predict(model,row)
             row["ml_predicted_mc"] = pmc
             row["ml_confidence"] = conf
             df.loc[len(df)] = row
 
+            ins = insider_proxy(d)
+            nar = narrative_proxy(d)
+            rugp = int(probs.get("RUG",0)*100)
+
+            if conf > 70 and rugp < 20:
+                alerts.append(f"🚀 Opportunity: {d['symbol']} strong structure & ML confidence")
+            if rugp > 40:
+                alerts.append(f"⚠️ Risk: {d['symbol']} high rug probability")
+
             results.append({
-                "symbol": d["symbol"],
-                "chain": d["chain"],
-                "pmc": pmc,
-                "conf": conf,
-                "ins": insider_proxy(d),
-                "nar": narrative_proxy(d),
-                "p": {k: int(v * 100) for k, v in probs.items()}
+                "symbol": d["symbol"],"chain": d["chain"],
+                "mc": int(d["mc"]),"pmc": pmc,"liq": int(d["liq"]),
+                "conf": conf,"ins": ins,"nar": nar,
+                "p": {k:int(v*100) for k,v in probs.items()}
             })
 
         save_csv(df, sha)
 
+        ranking = sorted(
+            results,
+            key=lambda x: (x["conf"]*0.4 + x["ins"]*0.3 + x["nar"]*0.2 - x["p"].get("RUG",0)*0.5),
+            reverse=True
+        )
+
     return render_template_string(
         HTML,
-        sc=len(df),
-        lb=df["label_outcome"].notna().sum(),
-        results=results,
-        cas=cas_text
+        sc=len(df), lb=labeled, ready=readiness,
+        results=results, ranking=ranking,
+        alerts=alerts, cas=cas_text
     )
 
 @app.route("/backtest")
@@ -273,13 +292,8 @@ def backtest():
     bt = df.dropna(subset=["mc_after_3d","ml_predicted_mc"])
     if len(bt) < 20:
         return "Not enough data for backtest yet"
-    corr,_ = spearmanr(bt["ml_predicted_mc"], bt["mc_after_3d"])
-    return f"""
-    <h2>📊 Backtest</h2>
-    Samples: {len(bt)}<br>
-    Correlation: {round(corr,3)}<br>
-    <a href="/">⬅ Back</a>
-    """
+    corr,_ = spearmanr(bt["ml_predicted_mc"],bt["mc_after_3d"])
+    return f"<h2>📊 Backtest</h2>Samples:{len(bt)}<br>Correlation:{round(corr,3)}<br><a href='/'>Back</a>"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
