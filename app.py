@@ -59,7 +59,6 @@ def fetch_dex(ca):
 
     tx5 = p.get("txns",{}).get("m5",{})
     tx1 = p.get("txns",{}).get("h1",{})
-    tx24 = p.get("txns",{}).get("h24",{})
     vol = p.get("volume",{})
     age = int((time.time()*1000 - p.get("pairCreatedAt",0))/60000)
 
@@ -75,40 +74,54 @@ def fetch_dex(ca):
         "age":age
     }
 
-# ===================== BNB-PROPHET STYLE STRUCTURE =====================
+# ===================== FAST RUG LABELING (NEW) =====================
+def fast_rug_check(df, ca, current_mc):
+    now = datetime.datetime.utcnow()
+    past = df[df["ca"] == ca]
+
+    for _, row in past.iterrows():
+        try:
+            ts = datetime.datetime.fromisoformat(row["timestamp"])
+        except:
+            continue
+
+        minutes = (now - ts).total_seconds() / 60
+        old_mc = row["market_cap"]
+
+        if old_mc <= 0: continue
+        drop = current_mc / old_mc
+
+        if minutes <= 15 and drop <= 0.3:
+            return "FAST_RUG_15M"
+        if minutes <= 60 and drop <= 0.3:
+            return "FAST_RUG_1H"
+
+    return ""
+
+# ===================== STRUCTURE (BNB STYLE) =====================
 def structural_projection(d):
-    if d["liq"] <= 0 or d["mc"] <= 0:
-        return d["mc"], 0
+    if d["liq"]<=0 or d["mc"]<=0:
+        return d["mc"],0
 
-    net_flow = d["buys5"] - d["sells5"]
-    total_flow = max(d["buys5"] + d["sells5"],1)
-    flow_strength = net_flow / total_flow
+    net = d["buys5"]-d["sells5"]
+    total = max(d["buys5"]+d["sells5"],1)
+    flow = net/total
 
-    liquidity_pressure = d["vol5"] / max(d["liq"],1)
-    liquidity_ratio = d["liq"] / d["mc"]
+    liq_pressure = d["vol5"]/max(d["liq"],1)
+    liq_ratio = d["liq"]/d["mc"]
+    age_boost = 1.8 if d["age"]<10 else 1.4 if d["age"]<30 else 1.1
 
-    age_boost = 1.8 if d["age"] < 10 else 1.4 if d["age"] < 30 else 1.1
+    projected = d["mc"]*(1+flow*liq_pressure*liq_ratio*age_boost*4)
 
-    amplifier = 4.0
+    if flow<0 and liq_pressure>0.7:
+        projected=0
 
-    projected_change = (
-        flow_strength *
-        liquidity_pressure *
-        liquidity_ratio *
-        age_boost *
-        amplifier
-    )
-
-    projected_mc = d["mc"] * (1 + projected_change)
-
-    if flow_strength < 0 and liquidity_pressure > 0.7:
-        projected_mc = 0
-
-    pct = ((projected_mc - d["mc"]) / d["mc"]) * 100
-    return int(max(projected_mc,0)), round(pct,2)
+    pct=((projected-d["mc"])/d["mc"])*100
+    return int(max(projected,0)),round(pct,2)
 
 # ===================== ML =====================
-MULT={"RUG":0.2,"FLAT":1,"2X":3,"5X":7,"10X":15,"20X":30}
+MULT={"RUG":0.2,"FAST_RUG_15M":0.15,"FAST_RUG_1H":0.2,
+      "FLAT":1,"2X":3,"5X":7,"10X":15,"20X":30}
 
 def train_ml(df):
     df=df.dropna(subset=["label_outcome"])
@@ -128,25 +141,25 @@ def ml_predict(m,row):
         row["volume_5m"],row["volume_1h"],
         row["age_minutes"],row["rsi_5m"],row["rsi_15m"]]]
     probs=dict(zip(m.classes_,m.predict_proba(X)[0]))
-    ev=sum(probs[k]*MULT[k] for k in probs)
-    return int(row["market_cap"]*ev), min(100,int(ev*6))
+    ev=sum(probs[k]*MULT.get(k,1) for k in probs)
+    return int(row["market_cap"]*ev),min(100,int(ev*6))
 
 # ===================== UI =====================
-HTML = """
+HTML="""
 <meta http-equiv="refresh" content="{{refresh}}">
-<h2>📊 Meme Scanner (BNB-Style + ML)</h2>
-<p>Scanned: {{sc}} | Labeled: {{lb}}</p>
+<h2 style="font-size:26px;">📊 Meme Scanner (BNB-Style + Fast Rug)</h2>
+<p style="font-size:18px;">Scanned: {{sc}} | Labeled: {{lb}}</p>
 
 <form method="post">
-<textarea name="cas" style="width:100%;height:120px;"></textarea><br>
-<button style="padding:14px 28px;font-size:18px;">🚀 Scan</button>
+<textarea name="cas" style="width:100%;height:120px;font-size:16px;"></textarea><br>
+<button style="padding:16px 32px;font-size:20px;">🚀 Scan</button>
 </form>
 
-<table border="1" cellpadding="6">
+<table border="1" cellpadding="8" style="font-size:16px;">
 <tr>
 <th>Coin</th><th>MC</th><th>Liq</th>
 <th>Struct MC</th><th>Struct %</th>
-<th>ML MC</th><th>ML Conf</th>
+<th>ML MC</th><th>Conf</th>
 </tr>
 
 {% for r in results %}
@@ -165,57 +178,50 @@ HTML = """
 
 @app.route("/",methods=["GET","POST"])
 def index():
-    df,sha = load_csv()
-    model = train_ml(df)
-    results = []
+    df,sha=load_csv()
+    model=train_ml(df)
+    results=[]
 
     if request.method=="POST":
         for ca in request.form.get("cas","").splitlines():
-            d = fetch_dex(ca.strip())
+            d=fetch_dex(ca.strip())
             if not d: continue
 
-            struct_mc, struct_pct = structural_projection(d)
+            struct_mc,struct_pct=structural_projection(d)
 
-            row = {
-                "timestamp": datetime.datetime.utcnow().isoformat(),
-                "ca": ca,
-                "symbol": d["symbol"],
-                "chain": d["chain"],
-                "price": 0,
-                "market_cap": d["mc"],
-                "liquidity": d["liq"],
-                "buys_5m": d["buys5"],
-                "sells_5m": d["sells5"],
-                "buys_1h": d["buys1"],
-                "sells_1h": d["sells1"],
-                "txns_24h": 0,
-                "volume_5m": d["vol5"],
-                "volume_1h": d["vol1"],
-                "volume_24h": 0,
-                "age_minutes": d["age"],
-                "rsi_5m": 50,
-                "rsi_15m": 50,
-                "liq_to_mc": d["liq"]/d["mc"]*100 if d["mc"] else 0,
-                "buy_sell_ratio": d["buys1"]/max(d["sells1"],1),
-                "label_outcome":"",
+            fast_label=fast_rug_check(df,ca.strip(),d["mc"])
+
+            row={
+                "timestamp":datetime.datetime.utcnow().isoformat(),
+                "ca":ca,"symbol":d["symbol"],"chain":d["chain"],
+                "price":0,"market_cap":d["mc"],"liquidity":d["liq"],
+                "buys_5m":d["buys5"],"sells_5m":d["sells5"],
+                "buys_1h":d["buys1"],"sells_1h":d["sells1"],
+                "txns_24h":0,
+                "volume_5m":d["vol5"],"volume_1h":d["vol1"],"volume_24h":0,
+                "age_minutes":d["age"],
+                "rsi_5m":50,"rsi_15m":50,
+                "liq_to_mc":d["liq"]/d["mc"]*100 if d["mc"] else 0,
+                "buy_sell_ratio":d["buys1"]/max(d["sells1"],1),
+                "label_outcome":fast_label,
                 "mc_after_3d":"",
                 "ml_predicted_mc":"",
                 "ml_confidence":""
             }
 
-            ml_mc, conf = ml_predict(model,row)
+            ml_mc,conf=ml_predict(model,row)
             row["ml_predicted_mc"]=ml_mc
             row["ml_confidence"]=conf
-            df.loc[len(df)] = row
+            df.loc[len(df)]=row
 
             results.append({
-                "symbol": d["symbol"],
-                "mc": int(d["mc"]),
-                "liq": int(d["liq"]),
-                "struct_mc": struct_mc,
-                "struct_pct": struct_pct,
-                "ml_mc": ml_mc,
-                "conf": conf
+                "symbol":d["symbol"],
+                "mc":int(d["mc"]),
+                "liq":int(d["liq"]),
+                "struct_mc":struct_mc,
+                "struct_pct":struct_pct,
+                "ml_mc":ml_mc,
+                "conf":conf
             })
 
         save_csv(df,sha)
