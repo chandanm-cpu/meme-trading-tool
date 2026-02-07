@@ -4,7 +4,7 @@ from flask import Flask, request, render_template_string
 from sklearn.ensemble import RandomForestClassifier
 from scipy.stats import spearmanr
 
-# ===================== GITHUB CSV STORAGE =====================
+# ===================== ENV =====================
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO  = os.environ.get("GITHUB_REPO")
 GITHUB_FILE  = os.environ.get("GITHUB_FILE", "coin_data.csv")
@@ -13,10 +13,11 @@ if not GITHUB_TOKEN or not GITHUB_REPO:
     raise RuntimeError("GitHub env vars missing")
 
 API = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
-HEADERS = {"Authorization": f"token {GITHUB_TOKEN}",
-           "Accept": "application/vnd.github.v3+json"}
+HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
 
-# ===================== CONFIG =====================
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 MIN_TRAIN_ROWS = 50
 AUTO_REFRESH = 10
@@ -34,7 +35,7 @@ CSV_HEADER = [
 
 app = Flask(__name__)
 
-# ===================== CSV HELPERS =====================
+# ===================== CSV =====================
 def load_csv():
     r = requests.get(API, headers=HEADERS)
     if r.status_code == 404:
@@ -50,18 +51,20 @@ def save_csv(df, sha):
     payload = {"message": "update data", "content": content, "sha": sha}
     requests.put(API, headers=HEADERS, json=payload)
 
-# ===================== INDICATORS =====================
+# ===================== HELPERS =====================
 def rsi(buys, sells):
     rs = buys / max(sells,1)
     return round(100 - (100/(1+rs)),2)
 
-# ===================== FETCH DEX =====================
 def fetch_dex(ca):
-    r = requests.get(DEX_URL+ca, timeout=10).json()
-    if not r.get("pairs"): return None
+    r = requests.get(DEX_URL + ca, timeout=10).json()
+    if not r.get("pairs"):
+        return None
     p = r["pairs"][0]
 
-    tx5, tx1, tx24 = (p.get("txns",{}).get(k,{}) for k in ("m5","h1","h24"))
+    tx5 = p.get("txns",{}).get("m5",{})
+    tx1 = p.get("txns",{}).get("h1",{})
+    tx24 = p.get("txns",{}).get("h24",{})
     vol = p.get("volume",{})
     age = int((time.time()*1000 - p.get("pairCreatedAt",0))/60000)
 
@@ -80,7 +83,6 @@ def fetch_dex(ca):
         "age":age
     }
 
-# ===================== ORACLE =====================
 def insider_proxy(d):
     s=0
     if d["buys1"]>d["sells1"]*2: s+=35
@@ -109,7 +111,8 @@ def train_ml(df):
     return m
 
 def ml_predict(m,row):
-    if m is None: return {},row["market_cap"],0
+    if m is None:
+        return {},row["market_cap"],0
     X=[[row["liq_to_mc"],row["buy_sell_ratio"],
         row["buys_5m"],row["buys_1h"],
         row["volume_5m"],row["volume_1h"],
@@ -118,7 +121,7 @@ def ml_predict(m,row):
     ev=sum(probs[k]*MULT[k] for k in probs)
     return probs,int(row["market_cap"]*ev),min(100,int(ev*6))
 
-# ===================== STRUCTURAL PROJECTION =====================
+# ===================== STRUCTURAL =====================
 def structural_projection(d):
     if d["liq"]<=0 or d["mc"]<=0: return 0
     net=d["buys5"]-d["sells5"]
@@ -130,19 +133,19 @@ def structural_projection(d):
     if flow<0 and impact>0.8: proj=0
     return int(max(proj,0))
 
-# ===================== READINESS =====================
 def ml_readiness(df):
     labeled=df["label_outcome"].notna().sum()
     return labeled,min(100,int(labeled/MIN_TRAIN_ROWS*100))
 
-# ===================== UI =====================
-HTML=f"""
-<meta http-equiv="refresh" content="{AUTO_REFRESH}">
+# ===================== HTML (NO f-string) =====================
+HTML = """
+<meta http-equiv="refresh" content="{{refresh}}">
 <h2>📱 Meme Trading Tool <a href="/backtest">📊 Backtest</a></h2>
+
 <p>
-Scanned: <b>{{{{sc}}}}</b> |
-Labeled: <b>{{{{lb}}}}</b> |
-ML Readiness: <b>{{{{ready}}}}%</b>
+Scanned: <b>{{sc}}</b> |
+Labeled: <b>{{lb}}</b> |
+ML Readiness: <b>{{ready}}%</b>
 </p>
 
 <form method="post">
@@ -197,7 +200,8 @@ def index():
             df.loc[len(df)]=row
 
             results.append({
-                "symbol":d["symbol"],"chain":d["chain"],
+                "symbol":d["symbol"],
+                "chain":d["chain"],
                 "mc":int(d["mc"]),
                 "struct_mc":struct_mc,
                 "ml_mc":ml_mc,
@@ -213,14 +217,16 @@ def index():
         results=results,
         sc=len(df),
         lb=labeled,
-        ready=ready
+        ready=ready,
+        refresh=AUTO_REFRESH
     )
 
 @app.route("/backtest")
 def backtest():
     df,_=load_csv()
     bt=df.dropna(subset=["mc_after_3d","ml_predicted_mc"])
-    if len(bt)<20: return "Not enough data for backtest"
+    if len(bt)<20:
+        return "Not enough data for backtest"
     corr,_=spearmanr(bt["ml_predicted_mc"],bt["mc_after_3d"])
     return f"<h2>Backtest</h2>Samples:{len(bt)}<br>Correlation:{round(corr,3)}<br><a href='/'>Back</a>"
 
