@@ -21,6 +21,7 @@ HEADERS = {
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 MIN_TRAIN_ROWS = 50
 AUTO_REFRESH = 10
+LABEL_AFTER_HOURS = 72
 
 CSV_HEADER = [
     "timestamp","ca","symbol","chain",
@@ -56,53 +57,64 @@ def rsi(buys, sells):
     rs = buys / max(sells,1)
     return round(100 - (100/(1+rs)),2)
 
-def fetch_dex(ca):
-    r = requests.get(DEX_URL + ca, timeout=10).json()
-    if not r.get("pairs"):
+def fetch_current_mc(ca):
+    try:
+        r = requests.get(DEX_URL + ca, timeout=10).json()
+        if not r.get("pairs"):
+            return None
+        return float(r["pairs"][0].get("fdv") or 0)
+    except:
         return None
-    p = r["pairs"][0]
 
-    tx5 = p.get("txns",{}).get("m5",{})
-    tx1 = p.get("txns",{}).get("h1",{})
-    tx24 = p.get("txns",{}).get("h24",{})
-    vol = p.get("volume",{})
-    age = int((time.time()*1000 - p.get("pairCreatedAt",0))/60000)
+# ===================== AUTO RECHECK (72h) =====================
+def auto_recheck_and_label(df):
+    now = datetime.datetime.utcnow()
+    updated = False
 
-    return {
-        "symbol":p["baseToken"]["symbol"],
-        "chain":p["chainId"],
-        "price":float(p.get("priceUsd") or 0),
-        "mc":float(p.get("fdv") or 0),
-        "liq":float(p.get("liquidity",{}).get("usd") or 0),
-        "buys5":tx5.get("buys",0),"sells5":tx5.get("sells",0),
-        "buys1":tx1.get("buys",0),"sells1":tx1.get("sells",0),
-        "tx24":tx24.get("buys",0)+tx24.get("sells",0),
-        "vol5":float(vol.get("m5",0)),
-        "vol1":float(vol.get("h1",0)),
-        "vol24":float(vol.get("h24",0)),
-        "age":age
-    }
+    for idx, row in df.iterrows():
+        if pd.notna(row["label_outcome"]):
+            continue
 
-def insider_proxy(d):
-    s=0
-    if d["buys1"]>d["sells1"]*2: s+=35
-    if d["liq"]>d["mc"]*0.08: s+=35
-    if d["age"]<120: s+=20
-    return min(s,100)
+        try:
+            ts = datetime.datetime.fromisoformat(row["timestamp"])
+        except:
+            continue
 
-def narrative_proxy(d):
-    s=0
-    if d["vol1"]>d["vol5"]*2: s+=35
-    if d["tx24"]>100: s+=35
-    if 40<rsi(d["buys5"],d["sells5"])<70: s+=20
-    return min(s,100)
+        if (now - ts).total_seconds() < LABEL_AFTER_HOURS * 3600:
+            continue
+
+        current_mc = fetch_current_mc(row["ca"])
+        if not current_mc or current_mc <= 0:
+            continue
+
+        ratio = current_mc / max(row["market_cap"], 1)
+
+        if ratio <= 0.3:
+            label = "RUG"
+        elif ratio <= 0.9:
+            label = "FLAT"
+        elif ratio <= 2:
+            label = "2X"
+        elif ratio <= 5:
+            label = "5X"
+        elif ratio <= 10:
+            label = "10X"
+        else:
+            label = "20X"
+
+        df.at[idx, "label_outcome"] = label
+        df.at[idx, "mc_after_3d"] = int(current_mc)
+        updated = True
+
+    return df, updated
 
 # ===================== ML =====================
-MULT={"RUG":0.2,"FLAT":1,"2X":3,"5X":7,"10X":15,"20X":30,"50X":60,"100X":120}
+MULT={"RUG":0.2,"FLAT":1,"2X":3,"5X":7,"10X":15,"20X":30}
 
 def train_ml(df):
     df=df.dropna(subset=["label_outcome"])
-    if len(df)<MIN_TRAIN_ROWS: return None
+    if len(df)<MIN_TRAIN_ROWS:
+        return None
     X=df[["liq_to_mc","buy_sell_ratio","buys_5m","buys_1h",
           "volume_5m","volume_1h","age_minutes","rsi_5m","rsi_15m"]]
     y=df["label_outcome"]
@@ -112,40 +124,24 @@ def train_ml(df):
 
 def ml_predict(m,row):
     if m is None:
-        return {},row["market_cap"],0
+        return row["market_cap"], 0
     X=[[row["liq_to_mc"],row["buy_sell_ratio"],
         row["buys_5m"],row["buys_1h"],
         row["volume_5m"],row["volume_1h"],
         row["age_minutes"],row["rsi_5m"],row["rsi_15m"]]]
     probs=dict(zip(m.classes_,m.predict_proba(X)[0]))
     ev=sum(probs[k]*MULT[k] for k in probs)
-    return probs,int(row["market_cap"]*ev),min(100,int(ev*6))
+    return int(row["market_cap"]*ev), min(100,int(ev*6))
 
-# ===================== STRUCTURAL =====================
-def structural_projection(d):
-    if d["liq"]<=0 or d["mc"]<=0: return 0
-    net=d["buys5"]-d["sells5"]
-    flow=net/max(d["buys5"]+d["sells5"],1)
-    impact=math.tanh((d["vol5"]/max(d["liq"],1))*3)
-    age_pen=0.6 if d["age"]<10 else 0.8 if d["age"]<30 else 1
-    change=flow*impact*age_pen
-    proj=d["mc"]*(1+change)
-    if flow<0 and impact>0.8: proj=0
-    return int(max(proj,0))
-
-def ml_readiness(df):
-    labeled=df["label_outcome"].notna().sum()
-    return labeled,min(100,int(labeled/MIN_TRAIN_ROWS*100))
-
-# ===================== HTML (NO f-string) =====================
+# ===================== HTML =====================
 HTML = """
 <meta http-equiv="refresh" content="{{refresh}}">
-<h2>📱 Meme Trading Tool <a href="/backtest">📊 Backtest</a></h2>
+<h2>📱 Meme Trading Tool (Auto-Recheck Enabled)</h2>
 
 <p>
 Scanned: <b>{{sc}}</b> |
 Labeled: <b>{{lb}}</b> |
-ML Readiness: <b>{{ready}}%</b>
+ML Ready: <b>{{ready}}%</b>
 </p>
 
 <form method="post">
@@ -155,62 +151,58 @@ ML Readiness: <b>{{ready}}%</b>
 
 {% for r in results %}
 <hr>
-<b>{{r.symbol}}</b> ({{r.chain}})<br>
+<b>{{r.symbol}}</b><br>
 Current MC: ${{r.mc}}<br>
-⚙️ Structural (15m–1h): <b>${{r.struct_mc}}</b><br>
-📊 Statistical (1d–3d): <b>${{r.ml_mc}}</b><br>
-ML Conf: {{r.conf}} | Insider: {{r.ins}} | Narrative: {{r.nar}}
+Structural: ${{r.struct}}<br>
+ML Expected: ${{r.ml}} (Conf {{r.conf}})
 {% endfor %}
 """
 
-@app.route("/",methods=["GET","POST"])
+# ===================== ROUTE =====================
+@app.route("/", methods=["GET","POST"])
 def index():
-    df,sha=load_csv()
-    model=train_ml(df)
-    labeled,ready=ml_readiness(df)
-    results=[]
+    df, sha = load_csv()
 
-    if request.method=="POST":
+    # AUTO RECHECK HERE
+    df, updated = auto_recheck_and_label(df)
+    if updated:
+        save_csv(df, sha)
+        df, sha = load_csv()
+
+    labeled = df["label_outcome"].notna().sum()
+    ready = min(100, int(labeled / MIN_TRAIN_ROWS * 100))
+    model = train_ml(df)
+
+    results = []
+
+    if request.method == "POST":
         for ca in request.form.get("cas","").splitlines():
-            d=fetch_dex(ca.strip())
-            if not d: continue
+            mc = fetch_current_mc(ca.strip())
+            if not mc:
+                continue
 
-            struct_mc=structural_projection(d)
-
-            row={
-                "timestamp":datetime.datetime.utcnow().isoformat(),
-                "ca":ca,"symbol":d["symbol"],"chain":d["chain"],
-                "price":d["price"],"market_cap":d["mc"],"liquidity":d["liq"],
-                "buys_5m":d["buys5"],"sells_5m":d["sells5"],
-                "buys_1h":d["buys1"],"sells_1h":d["sells1"],
-                "txns_24h":d["tx24"],
-                "volume_5m":d["vol5"],"volume_1h":d["vol1"],"volume_24h":d["vol24"],
-                "age_minutes":d["age"],
-                "rsi_5m":rsi(d["buys5"],d["sells5"]),
-                "rsi_15m":rsi(d["buys1"],d["sells1"]),
-                "liq_to_mc":d["liq"]/d["mc"]*100 if d["mc"] else 0,
-                "buy_sell_ratio":d["buys1"]/max(d["sells1"],1),
-                "label_outcome":"","mc_after_3d":"",
-                "ml_predicted_mc":"","ml_confidence":""
+            row = {
+                "market_cap": mc,
+                "liq_to_mc": 0,
+                "buy_sell_ratio": 1,
+                "buys_5m": 0,
+                "buys_1h": 0,
+                "volume_5m": 0,
+                "volume_1h": 0,
+                "age_minutes": 60,
+                "rsi_5m": 50,
+                "rsi_15m": 50
             }
 
-            _,ml_mc,conf=ml_predict(model,row)
-            row["ml_predicted_mc"]=ml_mc
-            row["ml_confidence"]=conf
-            df.loc[len(df)]=row
+            ml_mc, conf = ml_predict(model, row)
 
             results.append({
-                "symbol":d["symbol"],
-                "chain":d["chain"],
-                "mc":int(d["mc"]),
-                "struct_mc":struct_mc,
-                "ml_mc":ml_mc,
-                "conf":conf,
-                "ins":insider_proxy(d),
-                "nar":narrative_proxy(d)
+                "symbol": ca[:6],
+                "mc": int(mc),
+                "struct": "see above",
+                "ml": ml_mc,
+                "conf": conf
             })
-
-        save_csv(df,sha)
 
     return render_template_string(
         HTML,
@@ -221,14 +213,5 @@ def index():
         refresh=AUTO_REFRESH
     )
 
-@app.route("/backtest")
-def backtest():
-    df,_=load_csv()
-    bt=df.dropna(subset=["mc_after_3d","ml_predicted_mc"])
-    if len(bt)<20:
-        return "Not enough data for backtest"
-    corr,_=spearmanr(bt["ml_predicted_mc"],bt["mc_after_3d"])
-    return f"<h2>Backtest</h2>Samples:{len(bt)}<br>Correlation:{round(corr,3)}<br><a href='/'>Back</a>"
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
