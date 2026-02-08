@@ -74,7 +74,7 @@ def fetch_dex(ca):
         "age":age
     }
 
-# ===================== FAST RUG LABELING (NEW) =====================
+# ===================== FAST RUG =====================
 def fast_rug_check(df, ca, current_mc):
     now = datetime.datetime.utcnow()
     past = df[df["ca"] == ca]
@@ -87,8 +87,8 @@ def fast_rug_check(df, ca, current_mc):
 
         minutes = (now - ts).total_seconds() / 60
         old_mc = row["market_cap"]
-
         if old_mc <= 0: continue
+
         drop = current_mc / old_mc
 
         if minutes <= 15 and drop <= 0.3:
@@ -98,7 +98,7 @@ def fast_rug_check(df, ca, current_mc):
 
     return ""
 
-# ===================== STRUCTURE (BNB STYLE) =====================
+# ===================== STRUCTURE =====================
 def structural_projection(d):
     if d["liq"]<=0 or d["mc"]<=0:
         return d["mc"],0
@@ -112,7 +112,6 @@ def structural_projection(d):
     age_boost = 1.8 if d["age"]<10 else 1.4 if d["age"]<30 else 1.1
 
     projected = d["mc"]*(1+flow*liq_pressure*liq_ratio*age_boost*4)
-
     if flow<0 and liq_pressure>0.7:
         projected=0
 
@@ -144,24 +143,65 @@ def ml_predict(m,row):
     ev=sum(probs[k]*MULT.get(k,1) for k in probs)
     return int(row["market_cap"]*ev),min(100,int(ev*6))
 
+# ===================== MANUAL AUTO LABEL =====================
+def manual_auto_label(df):
+    now = datetime.datetime.utcnow()
+    checked = labeled = 0
+
+    for idx,row in df.iterrows():
+        if pd.notna(row["label_outcome"]): continue
+        try:
+            ts = datetime.datetime.fromisoformat(row["timestamp"])
+        except:
+            continue
+
+        if (now-ts).total_seconds() < LABEL_AFTER_HOURS*3600:
+            continue
+
+        checked += 1
+        d = fetch_dex(row["ca"])
+        if not d or d["mc"]<=0: continue
+
+        ratio = d["mc"]/max(row["market_cap"],1)
+        label = ("RUG" if ratio<=0.3 else
+                 "FLAT" if ratio<=0.9 else
+                 "2X" if ratio<=2 else
+                 "5X" if ratio<=5 else
+                 "10X" if ratio<=10 else "20X")
+
+        df.at[idx,"label_outcome"]=label
+        df.at[idx,"mc_after_3d"]=int(d["mc"])
+        labeled += 1
+
+    return df,checked,labeled
+
 # ===================== UI =====================
-HTML="""
+HTML = """
 <meta http-equiv="refresh" content="{{refresh}}">
-<h2 style="font-size:26px;">📊 Meme Scanner (BNB-Style + Fast Rug)</h2>
-<p style="font-size:18px;">Scanned: {{sc}} | Labeled: {{lb}}</p>
+<h2 style="font-size:26px;">📊 Meme Scanner</h2>
+<p style="font-size:18px;">
+Scanned: {{sc}} | Labeled: {{lb}}
+</p>
 
 <form method="post">
 <textarea name="cas" style="width:100%;height:120px;font-size:16px;"></textarea><br>
 <button style="padding:16px 32px;font-size:20px;">🚀 Scan</button>
 </form>
 
-<table border="1" cellpadding="8" style="font-size:16px;">
+<form method="post" action="/auto_label">
+<button style="padding:14px 28px;font-size:18px;margin-top:8px;">🧠 Auto Label (72h)</button>
+</form>
+
+<form method="get" action="/backtest">
+<button style="padding:14px 28px;font-size:18px;margin-top:8px;">📊 Backtest</button>
+</form>
+
+<table border="1" cellpadding="8" style="font-size:16px;margin-top:10px;">
 <tr>
 <th>Coin</th><th>MC</th><th>Liq</th>
 <th>Struct MC</th><th>Struct %</th>
 <th>ML MC</th><th>Conf</th>
 </tr>
-
 {% for r in results %}
 <tr>
 <td>{{r.symbol}}</td>
@@ -188,7 +228,6 @@ def index():
             if not d: continue
 
             struct_mc,struct_pct=structural_projection(d)
-
             fast_label=fast_rug_check(df,ca.strip(),d["mc"])
 
             row={
@@ -233,6 +272,22 @@ def index():
         lb=df["label_outcome"].notna().sum(),
         refresh=AUTO_REFRESH
     )
+
+@app.route("/auto_label",methods=["POST"])
+def auto_label():
+    df,sha=load_csv()
+    df,checked,labeled=manual_auto_label(df)
+    save_csv(df,sha)
+    return f"<h3>Auto Label Complete</h3>Checked:{checked}<br>Labeled:{labeled}<br><a href='/'>Back</a>"
+
+@app.route("/backtest")
+def backtest():
+    df,_=load_csv()
+    bt=df.dropna(subset=["mc_after_3d","ml_predicted_mc"])
+    if len(bt)<20:
+        return "Not enough labeled data"
+    corr,_=spearmanr(bt["ml_predicted_mc"],bt["mc_after_3d"])
+    return f"<h3>Backtest</h3>Samples:{len(bt)}<br>Correlation:{round(corr,3)}<br><a href='/'>Back</a>"
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
