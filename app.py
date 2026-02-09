@@ -67,8 +67,6 @@ def fetch_dex(ca):
             "chain": p["chainId"],
             "mc": float(p.get("fdv") or 0),
             "liq": float(p.get("liquidity",{}).get("usd") or 0),
-            "buys5": tx5.get("buys",0),
-            "sells5": tx5.get("sells",0),
             "buys1": tx1.get("buys",0),
             "sells1": tx1.get("sells",0),
             "vol5": float(vol.get("m5",0)),
@@ -122,57 +120,50 @@ def quantile_predict(m, row):
 def manual_auto_label(df):
     now = datetime.datetime.utcnow()
     checked = labeled = 0
-
     for idx,row in df.iterrows():
-        try:
-            if pd.notna(row["label_outcome"]):
-                continue
-
-            ts = datetime.datetime.fromisoformat(str(row["timestamp"]))
-            if (now - ts).total_seconds() < LABEL_AFTER_HOURS * 3600:
-                continue
-
-            checked += 1
-            d = fetch_dex(row["ca"])
-
-            if not d or d["mc"] <= 0:
-                df.at[idx,"label_outcome"] = "RUG"
-                df.at[idx,"mc_after_3d"] = 0
-                labeled += 1
-                continue
-
-            ratio = d["mc"] / max(row["market_cap"], 1)
-            label = (
-                "RUG" if ratio <= 0.3 else
-                "FLAT" if ratio <= 0.9 else
-                "2X" if ratio <= 2 else
-                "5X" if ratio <= 5 else
-                "10X" if ratio <= 10 else
-                "20X"
-            )
-
-            df.at[idx,"label_outcome"] = label
-            df.at[idx,"mc_after_3d"] = int(d["mc"])
-            labeled += 1
-
-        except Exception:
-            traceback.print_exc()
+        if pd.notna(row["label_outcome"]):
             continue
-
+        ts = datetime.datetime.fromisoformat(str(row["timestamp"]))
+        if (now-ts).total_seconds() < LABEL_AFTER_HOURS*3600:
+            continue
+        checked += 1
+        d = fetch_dex(row["ca"])
+        if not d or d["mc"] <= 0:
+            df.at[idx,"label_outcome"] = "RUG"
+            df.at[idx,"mc_after_3d"] = 0
+            labeled += 1
+            continue
+        ratio = d["mc"] / max(row["market_cap"],1)
+        label = (
+            "RUG" if ratio <= 0.3 else
+            "FLAT" if ratio <= 0.9 else
+            "2X" if ratio <= 2 else
+            "5X" if ratio <= 5 else
+            "10X" if ratio <= 10 else
+            "20X"
+        )
+        df.at[idx,"label_outcome"] = label
+        df.at[idx,"mc_after_3d"] = int(d["mc"])
+        labeled += 1
     return df, checked, labeled
 
 # ===================== ROUTES =====================
 @app.route("/", methods=["GET","POST"])
 def index():
     df, sha = load_csv()
+    scanned = len(df)
+    labeled = df["label_outcome"].notna().sum()
+
     rf = train_rf(df)
-    q10 = train_quantile(df, 0.1)
-    q50 = train_quantile(df, 0.5)
-    q90 = train_quantile(df, 0.9)
+    q10 = train_quantile(df,0.1)
+    q50 = train_quantile(df,0.5)
+    q90 = train_quantile(df,0.9)
 
     results = []
+    did_scan = False
 
     if request.method == "POST":
+        did_scan = True
         for ca in request.form.get("cas","").splitlines():
             d = fetch_dex(ca.strip())
             if not d:
@@ -187,35 +178,41 @@ def index():
                 "market_cap": d["mc"]
             }
 
-            probs = rf_probs(rf, row)
+            probs = rf_probs(rf,row)
 
             results.append({
                 "symbol": d["symbol"],
                 "mc": int(d["mc"]),
                 "liq": int(d["liq"]),
-                "surv24": survival_from_probs(probs, 24),
-                "surv72": survival_from_probs(probs, 72),
-                "down": quantile_predict(q10, row),
-                "mid": quantile_predict(q50, row),
-                "up": quantile_predict(q90, row),
+                "surv24": survival_from_probs(probs,24),
+                "surv72": survival_from_probs(probs,72),
+                "down": quantile_predict(q10,row),
+                "mid": quantile_predict(q50,row),
+                "up": quantile_predict(q90,row),
                 "conf": int(max(probs.values())*100) if probs else 0
             })
 
     html = """
+    {% if did_scan %}
     <meta http-equiv="refresh" content="{{refresh}}">
+    {% endif %}
+
     <h2 style="font-size:42px;">📊 ML Meme Oracle</h2>
+    <p style="font-size:24px;">
+      Scanned: {{scanned}} | Labeled: {{labeled}}
+    </p>
 
     <form method="post">
       <textarea name="cas" style="width:100%;height:140px;font-size:26px;"></textarea><br>
-      <button style="font-size:30px;padding:18px;">🚀 Scan</button>
+      <button style="font-size:32px;padding:20px;">🚀 Scan</button>
     </form>
 
     <form method="post" action="/auto_label">
-      <button style="font-size:26px;padding:14px;margin-top:8px;">🧠 Auto Label (72h)</button>
+      <button style="font-size:20px;padding:10px;margin-top:6px;">🧠 Auto Label</button>
     </form>
 
     <form method="get" action="/backtest">
-      <button style="font-size:26px;padding:14px;margin-top:8px;">📊 Backtest</button>
+      <button style="font-size:20px;padding:10px;margin-top:6px;">📊 Backtest</button>
     </form>
 
     <table border="1" cellpadding="18" style="font-size:48px;margin-top:20px;">
@@ -244,22 +241,18 @@ def index():
     return render_template_string(
         html,
         results=results,
-        refresh=AUTO_REFRESH
+        refresh=AUTO_REFRESH,
+        scanned=scanned,
+        labeled=labeled,
+        did_scan=did_scan
     )
 
 @app.route("/auto_label", methods=["POST"])
 def auto_label():
     df, sha = load_csv()
-    if sha is None:
-        return "CSV not initialized"
     df, checked, labeled = manual_auto_label(df)
     save_csv(df, sha)
-    return f"""
-    <h2>🧠 Auto Label Complete</h2>
-    Checked: {checked}<br>
-    Labeled: {labeled}<br>
-    <a href="/">⬅ Back</a>
-    """
+    return f"<h3>Auto label done</h3>Checked: {checked}<br>Labeled: {labeled}<br><a href='/'>Back</a>"
 
 @app.route("/backtest")
 def backtest():
@@ -268,12 +261,7 @@ def backtest():
     if len(bt) < 20:
         return "Not enough labeled data"
     corr,_ = spearmanr(bt["ml_predicted_mc"], bt["mc_after_3d"])
-    return f"""
-    <h2>📊 Backtest</h2>
-    Samples: {len(bt)}<br>
-    Correlation: {round(corr,3)}<br>
-    <a href="/">⬅ Back</a>
-    """
+    return f"<h3>Backtest</h3>Samples: {len(bt)}<br>Correlation: {round(corr,3)}<br><a href='/'>Back</a>"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
