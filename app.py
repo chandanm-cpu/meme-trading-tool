@@ -1,7 +1,8 @@
-import os, io, time, datetime, base64, requests, math, traceback
+import os, io, time, datetime, base64, requests, traceback
 import pandas as pd
 from flask import Flask, request, render_template_string
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+from lifelines import CoxPHFitter
 from scipy.stats import spearmanr
 
 # ===================== ENV =====================
@@ -10,10 +11,7 @@ GITHUB_REPO  = os.environ.get("GITHUB_REPO")
 GITHUB_FILE  = os.environ.get("GITHUB_FILE", "coin_data.csv")
 
 API = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
-HEADERS = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json"
-}
+HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"}
 
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 AUTO_REFRESH = 10
@@ -43,26 +41,26 @@ def load_csv():
     return pd.read_csv(io.StringIO(content)), j["sha"]
 
 def save_csv(df, sha):
-    if sha is None:
-        return
+    if sha is None: return
     buf = io.StringIO()
     df.to_csv(buf, index=False)
-    content = base64.b64encode(buf.getvalue().encode()).decode()
-    payload = {"message": "update data", "content": content, "sha": sha}
+    payload = {
+        "message": "update data",
+        "content": base64.b64encode(buf.getvalue().encode()).decode(),
+        "sha": sha
+    }
     requests.put(API, headers=HEADERS, json=payload)
 
-# ===================== HELPERS =====================
+# ===================== DEX =====================
 def fetch_dex(ca):
     try:
-        r = requests.get(DEX_URL + ca, timeout=10).json()
-        if not r.get("pairs"):
-            return None
+        r = requests.get(DEX_URL+ca, timeout=10).json()
+        if not r.get("pairs"): return None
         p = r["pairs"][0]
         tx5 = p.get("txns",{}).get("m5",{})
         tx1 = p.get("txns",{}).get("h1",{})
         vol = p.get("volume",{})
         age = int((time.time()*1000 - p.get("pairCreatedAt",0))/60000)
-
         return {
             "symbol":p["baseToken"]["symbol"],
             "chain":p["chainId"],
@@ -77,206 +75,126 @@ def fetch_dex(ca):
     except:
         return None
 
-# ===================== STRUCTURE =====================
-def structural_projection(d):
-    if d["liq"]<=0 or d["mc"]<=0:
-        return d["mc"],0
-    net = d["buys5"]-d["sells5"]
-    total = max(d["buys5"]+d["sells5"],1)
-    flow = net/total
-    liq_pressure = d["vol5"]/max(d["liq"],1)
-    liq_ratio = d["liq"]/d["mc"]
-    age_boost = 1.8 if d["age"]<10 else 1.4 if d["age"]<30 else 1.1
-    projected = d["mc"]*(1+flow*liq_pressure*liq_ratio*age_boost*4)
-    if flow<0 and liq_pressure>0.7:
-        projected=0
-    pct=((projected-d["mc"])/d["mc"])*100
-    return int(max(projected,0)),round(pct,2)
-
-# ===================== ML =====================
-MULT={"RUG":0.2,"FAST_RUG_15M":0.15,"FAST_RUG_1H":0.2,
-      "FLAT":1,"2X":3,"5X":7,"10X":15,"20X":30}
-
-def train_ml(df):
+# ===================== MODELS =====================
+def train_rf(df):
     df=df.dropna(subset=["label_outcome"])
     if len(df)<MIN_TRAIN_ROWS: return None
-    X=df[["liq_to_mc","buy_sell_ratio","buys_5m","buys_1h",
-          "volume_5m","volume_1h","age_minutes","rsi_5m","rsi_15m"]]
+    X=df[["liq_to_mc","buy_sell_ratio","volume_5m","volume_1h","age_minutes"]]
     y=df["label_outcome"]
-    m=RandomForestClassifier(n_estimators=300,max_depth=10,min_samples_leaf=10)
+    m=RandomForestClassifier(n_estimators=300,max_depth=10)
     m.fit(X,y)
     return m
 
-def ml_predict(m,row):
-    if m is None:
-        return row["market_cap"],0
-    X=[[row["liq_to_mc"],row["buy_sell_ratio"],
-        row["buys_5m"],row["buys_1h"],
-        row["volume_5m"],row["volume_1h"],
-        row["age_minutes"],row["rsi_5m"],row["rsi_15m"]]]
-    probs=dict(zip(m.classes_,m.predict_proba(X)[0]))
-    ev=sum(probs[k]*MULT.get(k,1) for k in probs)
-    return int(row["market_cap"]*ev),min(100,int(ev*6))
+def rf_confidence(m,row):
+    if m is None: return 0
+    X=[[row["liq_to_mc"],row["buy_sell_ratio"],row["volume_5m"],row["volume_1h"],row["age_minutes"]]]
+    p=m.predict_proba(X)[0]
+    return int(max(p)*100)
 
-# ===================== MANUAL AUTO LABEL (FIXED) =====================
-def manual_auto_label(df):
-    now = datetime.datetime.utcnow()
-    checked = labeled = 0
+def train_survival(df):
+    df=df.dropna(subset=["label_outcome"])
+    if len(df)<MIN_TRAIN_ROWS: return None
+    df["event"] = df["label_outcome"].str.contains("RUG").astype(int)
+    df["duration"] = df["age_minutes"]
+    cph=CoxPHFitter()
+    cph.fit(df[["duration","event","liq_to_mc","buy_sell_ratio","volume_5m","volume_1h"]],
+            duration_col="duration",event_col="event")
+    return cph
 
-    for idx,row in df.iterrows():
-        try:
-            if pd.notna(row["label_outcome"]):
-                continue
+def survival_prob(cph,row,hours):
+    if cph is None: return 0
+    df=pd.DataFrame([{
+        "liq_to_mc":row["liq_to_mc"],
+        "buy_sell_ratio":row["buy_sell_ratio"],
+        "volume_5m":row["volume_5m"],
+        "volume_1h":row["volume_1h"]
+    }])
+    surv=cph.predict_survival_function(df, times=[hours*60])
+    return int(surv.iloc[0,0]*100)
 
-            ts = datetime.datetime.fromisoformat(str(row["timestamp"]))
-            if (now-ts).total_seconds() < LABEL_AFTER_HOURS*3600:
-                continue
+def train_quantile(df,q):
+    df=df.dropna(subset=["mc_after_3d"])
+    if len(df)<MIN_TRAIN_ROWS: return None
+    X=df[["liq_to_mc","buy_sell_ratio","volume_5m","volume_1h","age_minutes"]]
+    y=df["mc_after_3d"]/df["market_cap"]
+    m=GradientBoostingRegressor(loss="quantile",alpha=q,n_estimators=200)
+    m.fit(X,y)
+    return m
 
-            checked += 1
-            d = fetch_dex(row["ca"])
-
-            if not d or d["mc"]<=0:
-                df.at[idx,"label_outcome"] = "RUG"
-                df.at[idx,"mc_after_3d"] = 0
-                labeled += 1
-                continue
-
-            ratio = d["mc"]/max(row["market_cap"],1)
-            label = ("RUG" if ratio<=0.3 else
-                     "FLAT" if ratio<=0.9 else
-                     "2X" if ratio<=2 else
-                     "5X" if ratio<=5 else
-                     "10X" if ratio<=10 else "20X")
-
-            df.at[idx,"label_outcome"]=label
-            df.at[idx,"mc_after_3d"]=int(d["mc"])
-            labeled += 1
-
-        except Exception as e:
-            print("AUTO LABEL ERROR:", e)
-            traceback.print_exc()
-            continue
-
-    return df,checked,labeled
+def quantile_predict(m,row):
+    if m is None: return 0
+    X=[[row["liq_to_mc"],row["buy_sell_ratio"],row["volume_5m"],row["volume_1h"],row["age_minutes"]]]
+    return int((m.predict(X)[0]-1)*100)
 
 # ===================== ROUTES =====================
-@app.route("/auto_label",methods=["POST"])
-def auto_label():
-    try:
-        df,sha=load_csv()
-        if df is None or sha is None:
-            return "<h3>CSV not ready</h3><a href='/'>Back</a>"
-
-        df,checked,labeled=manual_auto_label(df)
-        save_csv(df,sha)
-
-        return f"""
-        <h3>🧠 Auto Label Complete</h3>
-        Checked: {checked}<br>
-        Labeled: {labeled}<br>
-        <a href="/">⬅ Back</a>
-        """
-    except Exception as e:
-        return f"<pre>Auto Label Failed:\n{traceback.format_exc()}</pre><a href='/'>Back</a>"
-
-@app.route("/backtest")
-def backtest():
-    df,_=load_csv()
-    bt=df.dropna(subset=["mc_after_3d","ml_predicted_mc"])
-    if len(bt)<20:
-        return "Not enough labeled data"
-    corr,_=spearmanr(bt["ml_predicted_mc"],bt["mc_after_3d"])
-    return f"<h3>Backtest</h3>Samples:{len(bt)}<br>Correlation:{round(corr,3)}<br><a href='/'>Back</a>"
-
 @app.route("/",methods=["GET","POST"])
 def index():
     df,sha=load_csv()
-    model=train_ml(df)
-    results=[]
+    rf=train_rf(df)
+    surv=train_survival(df)
+    q10=train_quantile(df,0.1)
+    q50=train_quantile(df,0.5)
+    q90=train_quantile(df,0.9)
 
+    results=[]
     if request.method=="POST":
         for ca in request.form.get("cas","").splitlines():
             d=fetch_dex(ca.strip())
             if not d: continue
 
-            struct_mc,struct_pct=structural_projection(d)
-
             row={
-                "timestamp":datetime.datetime.utcnow().isoformat(),
-                "ca":ca,"symbol":d["symbol"],"chain":d["chain"],
-                "price":0,"market_cap":d["mc"],"liquidity":d["liq"],
-                "buys_5m":d["buys5"],"sells_5m":d["sells5"],
-                "buys_1h":d["buys1"],"sells_1h":d["sells1"],
-                "txns_24h":0,
-                "volume_5m":d["vol5"],"volume_1h":d["vol1"],"volume_24h":0,
-                "age_minutes":d["age"],
-                "rsi_5m":50,"rsi_15m":50,
                 "liq_to_mc":d["liq"]/d["mc"]*100 if d["mc"] else 0,
                 "buy_sell_ratio":d["buys1"]/max(d["sells1"],1),
-                "label_outcome":"",
-                "mc_after_3d":"",
-                "ml_predicted_mc":"",
-                "ml_confidence":""
+                "volume_5m":d["vol5"],
+                "volume_1h":d["vol1"],
+                "age_minutes":d["age"],
+                "market_cap":d["mc"]
             }
-
-            ml_mc,conf=ml_predict(model,row)
-            row["ml_predicted_mc"]=ml_mc
-            row["ml_confidence"]=conf
-            df.loc[len(df)] = row
 
             results.append({
                 "symbol":d["symbol"],
                 "mc":int(d["mc"]),
                 "liq":int(d["liq"]),
-                "struct_mc":struct_mc,
-                "struct_pct":struct_pct,
-                "ml_mc":ml_mc,
-                "conf":conf
+                "surv24":survival_prob(surv,row,24),
+                "surv72":survival_prob(surv,row,72),
+                "q10":quantile_predict(q10,row),
+                "q50":quantile_predict(q50,row),
+                "q90":quantile_predict(q90,row),
+                "conf":rf_confidence(rf,row)
             })
 
-        save_csv(df,sha)
-
-    HTML = """
+    HTML="""
     <meta http-equiv="refresh" content="{{refresh}}">
-    <h2 style="font-size:26px;">📊 Meme Scanner</h2>
-    <p style="font-size:18px;">Scanned: {{sc}} | Labeled: {{lb}}</p>
-
+    <h2 style="font-size:36px;">📊 ML Meme Oracle</h2>
     <form method="post">
-    <textarea name="cas" style="width:100%;height:120px;font-size:16px;"></textarea><br>
-    <button style="padding:16px 32px;font-size:20px;">🚀 Scan</button>
+    <textarea name="cas" style="width:100%;height:120px;font-size:24px;"></textarea><br>
+    <button style="font-size:28px;padding:16px;">Scan</button>
     </form>
 
-    <form method="post" action="/auto_label">
-    <button style="padding:14px 28px;font-size:18px;">🧠 Auto Label (72h)</button>
-    </form>
-
-    <form method="get" action="/backtest">
-    <button style="padding:14px 28px;font-size:18px;">📊 Backtest</button>
-    </form>
-
-    <table border="1" cellpadding="8" style="font-size:16px;">
-    <tr><th>Coin</th><th>MC</th><th>Liq</th><th>Struct MC</th><th>Struct %</th><th>ML MC</th><th>Conf</th></tr>
+    <table border="1" cellpadding="16" style="font-size:48px;margin-top:20px;">
+    <tr>
+    <th>Coin</th><th>MC</th><th>Liq</th>
+    <th>Surv 24h</th><th>Surv 72h</th>
+    <th>Down %</th><th>Median %</th><th>Up %</th>
+    <th>Conf</th>
+    </tr>
     {% for r in results %}
     <tr>
     <td>{{r.symbol}}</td>
     <td>${{r.mc}}</td>
     <td>${{r.liq}}</td>
-    <td>${{r.struct_mc}}</td>
-    <td>{{r.struct_pct}}%</td>
-    <td>${{r.ml_mc}}</td>
+    <td>{{r.surv24}}%</td>
+    <td>{{r.surv72}}%</td>
+    <td>{{r.q10}}%</td>
+    <td>{{r.q50}}%</td>
+    <td>{{r.q90}}%</td>
     <td>{{r.conf}}</td>
     </tr>
     {% endfor %}
     </table>
     """
 
-    return render_template_string(
-        HTML,
-        results=results,
-        sc=len(df),
-        lb=df["label_outcome"].notna().sum(),
-        refresh=AUTO_REFRESH
-    )
+    return render_template_string(HTML,results=results,refresh=AUTO_REFRESH)
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
