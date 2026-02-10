@@ -4,7 +4,7 @@ from flask import Flask, request, render_template_string
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
 from scipy.stats import spearmanr
 
-# ================= CONFIG =================
+# ============ CONFIG ============
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO  = os.environ.get("GITHUB_REPO")
 GITHUB_FILE  = os.environ.get("GITHUB_FILE","coin_data.csv")
@@ -28,9 +28,14 @@ CSV_HEADER = [
 
 app = Flask(__name__)
 
-# ================= CSV =================
+# ============ HEALTH (FAST) ============
+@app.route("/health")
+def health():
+    return "OK"
+
+# ============ CSV ============
 def load_csv():
-    r = requests.get(API, headers=HEADERS)
+    r = requests.get(API, headers=HEADERS, timeout=10)
     if r.status_code == 404:
         return pd.DataFrame(columns=CSV_HEADER), None
     j = r.json()
@@ -45,12 +50,12 @@ def save_csv(df, sha):
         "content":base64.b64encode(buf.getvalue().encode()).decode(),
         "sha":sha
     }
-    requests.put(API, headers=HEADERS, json=payload)
+    requests.put(API, headers=HEADERS, json=payload, timeout=10)
 
-# ================= DEX =================
+# ============ DEX ============
 def fetch_dex(ca):
     try:
-        r = requests.get(DEX_URL+ca,timeout=10).json()
+        r = requests.get(DEX_URL+ca, timeout=10).json()
         if not r.get("pairs"):
             return None
         p = r["pairs"][0]
@@ -71,7 +76,7 @@ def fetch_dex(ca):
     except:
         return None
 
-# ================= ML =================
+# ============ ML ============
 def train_rf(df):
     df=df.dropna(subset=["label_outcome"])
     if len(df)<MIN_TRAIN_ROWS:
@@ -100,7 +105,7 @@ def train_quantile(df,q):
         return None
     X=df[["liq_to_mc","buy_sell_ratio","volume_5m","volume_1h","age_minutes"]]
     y=df["mc_after_3d"]/df["market_cap"]
-    m=GradientBoostingRegressor(loss="quantile",alpha=q,n_estimators=150)
+    m=GradientBoostingRegressor(loss="quantile",alpha=q,n_estimators=120)
     m.fit(X,y)
     return m
 
@@ -111,7 +116,7 @@ def quantile_predict(m,row):
         row["volume_5m"],row["volume_1h"],row["age_minutes"]]]
     return int((m.predict(X)[0]-1)*100)
 
-# ================= AUTO LABEL =================
+# ============ AUTO LABEL ============
 def auto_label(df):
     now=datetime.datetime.utcnow()
     checked=labeled=0
@@ -136,23 +141,22 @@ def auto_label(df):
         labeled+=1
     return df,checked,labeled
 
-# ================= ROUTES =================
+# ============ ROUTES ============
 @app.route("/",methods=["GET","POST"])
 def index():
     df,sha=load_csv()
     scanned=len(df)
     labeled=df["label_outcome"].notna().sum()
 
-    rf=train_rf(df)
-    q10=train_quantile(df,0.1)
-    q50=train_quantile(df,0.5)
-    q90=train_quantile(df,0.9)
-
     results=[]
 
     if request.method=="POST":
-        cas=request.form.get("cas","").splitlines()
-        for ca in cas:
+        rf=train_rf(df)
+        q10=train_quantile(df,0.1)
+        q50=train_quantile(df,0.5)
+        q90=train_quantile(df,0.9)
+
+        for ca in request.form.get("cas","").splitlines():
             ca=ca.strip()
             if not ca or ca in df["ca"].values:
                 continue
