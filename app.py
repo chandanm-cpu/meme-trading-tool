@@ -4,7 +4,7 @@ from flask import Flask, request, render_template_string
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
 from scipy.stats import spearmanr
 
-# ============ CONFIG ============
+# ================= CONFIG =================
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO  = os.environ.get("GITHUB_REPO")
 GITHUB_FILE  = os.environ.get("GITHUB_FILE","coin_data.csv")
@@ -28,12 +28,12 @@ CSV_HEADER = [
 
 app = Flask(__name__)
 
-# ============ HEALTH (FAST) ============
+# ================= FAST HEALTH =================
 @app.route("/health")
 def health():
     return "OK"
 
-# ============ CSV ============
+# ================= CSV =================
 def load_csv():
     r = requests.get(API, headers=HEADERS, timeout=10)
     if r.status_code == 404:
@@ -52,10 +52,10 @@ def save_csv(df, sha):
     }
     requests.put(API, headers=HEADERS, json=payload, timeout=10)
 
-# ============ DEX ============
+# ================= DEX =================
 def fetch_dex(ca):
     try:
-        r = requests.get(DEX_URL+ca, timeout=10).json()
+        r = requests.get(DEX_URL+ca,timeout=10).json()
         if not r.get("pairs"):
             return None
         p = r["pairs"][0]
@@ -76,47 +76,46 @@ def fetch_dex(ca):
     except:
         return None
 
-# ============ ML ============
-def train_rf(df):
+# ================= ML =================
+def train_survivor(df):
     df=df.dropna(subset=["label_outcome"])
     if len(df)<MIN_TRAIN_ROWS:
         return None
+    df["is_survivor"]=~df["label_outcome"].str.contains("RUG")
     X=df[["liq_to_mc","buy_sell_ratio","volume_5m","volume_1h","age_minutes"]]
-    y=df["label_outcome"]
-    m=RandomForestClassifier(n_estimators=200,max_depth=8)
+    y=df["is_survivor"]
+    m=RandomForestClassifier(n_estimators=250,max_depth=8)
     m.fit(X,y)
     return m
 
-def rf_probs(m,row):
+def survivor_prob(m,row):
     if m is None:
-        return {}
+        return 0
     X=[[row["liq_to_mc"],row["buy_sell_ratio"],
         row["volume_5m"],row["volume_1h"],row["age_minutes"]]]
-    return dict(zip(m.classes_,m.predict_proba(X)[0]))
+    return int(m.predict_proba(X)[0][1]*100)
 
-def survival_from_probs(probs,hours):
-    rug=sum(v for k,v in probs.items() if "RUG" in k)
-    decay=0.85 if hours==72 else 1
-    return int(max(0,(1-rug*decay)*100))
-
-def train_quantile(df,q):
-    df=df.dropna(subset=["mc_after_3d"])
+def train_upside(df,q):
+    df=df[df["label_outcome"].notna() & ~df["label_outcome"].str.contains("RUG")]
     if len(df)<MIN_TRAIN_ROWS:
         return None
     X=df[["liq_to_mc","buy_sell_ratio","volume_5m","volume_1h","age_minutes"]]
     y=df["mc_after_3d"]/df["market_cap"]
-    m=GradientBoostingRegressor(loss="quantile",alpha=q,n_estimators=120)
+    m=GradientBoostingRegressor(loss="quantile",alpha=q,n_estimators=150)
     m.fit(X,y)
     return m
 
-def quantile_predict(m,row):
+def upside_predict(m,row):
     if m is None:
         return 0
     X=[[row["liq_to_mc"],row["buy_sell_ratio"],
         row["volume_5m"],row["volume_1h"],row["age_minutes"]]]
     return int((m.predict(X)[0]-1)*100)
 
-# ============ AUTO LABEL ============
+def rank_score(surv,mid,up,conf):
+    return min(100,int(0.4*surv + 0.3*max(mid,0) + 0.2*max(up,0)/2 + 0.1*conf))
+
+# ================= AUTO LABEL =================
 def auto_label(df):
     now=datetime.datetime.utcnow()
     checked=labeled=0
@@ -141,21 +140,21 @@ def auto_label(df):
         labeled+=1
     return df,checked,labeled
 
-# ============ ROUTES ============
+# ================= ROUTES =================
 @app.route("/",methods=["GET","POST"])
 def index():
     df,sha=load_csv()
     scanned=len(df)
     labeled=df["label_outcome"].notna().sum()
 
+    surv_model=train_survivor(df)
+    q10=train_upside(df,0.1)
+    q50=train_upside(df,0.5)
+    q90=train_upside(df,0.9)
+
     results=[]
 
     if request.method=="POST":
-        rf=train_rf(df)
-        q10=train_quantile(df,0.1)
-        q50=train_quantile(df,0.5)
-        q90=train_quantile(df,0.9)
-
         for ca in request.form.get("cas","").splitlines():
             ca=ca.strip()
             if not ca or ca in df["ca"].values:
@@ -184,23 +183,28 @@ def index():
 
             df=pd.concat([df,pd.DataFrame([row])],ignore_index=True)
 
-            probs=rf_probs(rf,row)
+            surv=survivor_prob(surv_model,row)
+            mid=upside_predict(q50,row) if surv>=50 else None
+            up=upside_predict(q90,row) if surv>=50 else None
+            down=upside_predict(q10,row) if surv>=50 else None
+
+            score=rank_score(surv,mid or 0,up or 0,0)
+
             results.append({
                 "symbol":d["symbol"],
                 "mc":int(d["mc"]),
                 "liq":int(d["liq"]),
-                "surv24":survival_from_probs(probs,24),
-                "surv72":survival_from_probs(probs,72),
-                "down":quantile_predict(q10,row),
-                "mid":quantile_predict(q50,row),
-                "up":quantile_predict(q90,row),
-                "conf":int(max(probs.values())*100) if probs else 0
+                "surv":surv,
+                "down":down,
+                "mid":mid,
+                "up":up,
+                "rank":score
             })
 
         save_csv(df,sha)
 
     html="""
-    <h2 style="font-size:42px;">📊 ML Meme Oracle</h2>
+    <h2 style="font-size:42px;">📊 ABC Meme Oracle</h2>
     <p style="font-size:26px;">Scanned: {{scanned}} | Labeled: {{labeled}}</p>
 
     <form method="post">
@@ -219,15 +223,18 @@ def index():
     <table border="1" cellpadding="18" style="font-size:48px;margin-top:20px;">
       <tr>
         <th>Coin</th><th>MC</th><th>Liq</th>
-        <th>Surv24</th><th>Surv72</th>
-        <th>Down%</th><th>Mid%</th><th>Up%</th><th>Conf</th>
+        <th>Survivor%</th>
+        <th>Down%</th><th>Mid%</th><th>Up%</th>
+        <th>Rank</th>
       </tr>
       {% for r in results %}
       <tr>
         <td>{{r.symbol}}</td><td>${{r.mc}}</td><td>${{r.liq}}</td>
-        <td>{{r.surv24}}%</td><td>{{r.surv72}}%</td>
-        <td>{{r.down}}%</td><td>{{r.mid}}%</td><td>{{r.up}}%</td>
-        <td>{{r.conf}}</td>
+        <td>{{r.surv}}</td>
+        <td>{{r.down if r.down is not none else "-"}}</td>
+        <td>{{r.mid if r.mid is not none else "-"}}</td>
+        <td>{{r.up if r.up is not none else "-"}}</td>
+        <td>{{r.rank}}</td>
       </tr>
       {% endfor %}
     </table>
@@ -239,7 +246,7 @@ def label():
     df,sha=load_csv()
     df,checked,labeled=auto_label(df)
     save_csv(df,sha)
-    return f"Labeled {labeled} of {checked} checked <br><a href='/'>Back</a>"
+    return f"Labeled {labeled} of {checked} checked<br><a href='/'>Back</a>"
 
 @app.route("/backtest")
 def backtest():
@@ -248,7 +255,7 @@ def backtest():
     if len(bt)<10:
         return "Not enough data"
     corr,_=spearmanr(bt["market_cap"],bt["mc_after_3d"])
-    return f"Samples: {len(bt)} | Correlation: {round(corr,3)} <br><a href='/'>Back</a>"
+    return f"Samples: {len(bt)} | Correlation: {round(corr,3)}<br><a href='/'>Back</a>"
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
