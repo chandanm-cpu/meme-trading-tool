@@ -1,7 +1,6 @@
 import os, io, time, datetime, base64, requests
 import pandas as pd
 from flask import Flask, request, render_template_string
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
 from scipy.stats import spearmanr
 
 # ================= CONFIG =================
@@ -11,7 +10,6 @@ GITHUB_FILE  = os.environ.get("GITHUB_FILE","coin_data.csv")
 
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 LABEL_AFTER_HOURS = 72
-MIN_TRAIN_ROWS = 30
 
 API = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"}
@@ -55,7 +53,7 @@ def save_csv(df, sha):
 # ================= DEX =================
 def fetch_dex(ca):
     try:
-        r = requests.get(DEX_URL+ca,timeout=10).json()
+        r = requests.get(DEX_URL+ca, timeout=10).json()
         if not r.get("pairs"):
             return None
         p = r["pairs"][0]
@@ -76,44 +74,68 @@ def fetch_dex(ca):
     except:
         return None
 
-# ================= ML =================
-def train_survivor(df):
-    df=df.dropna(subset=["label_outcome"])
-    if len(df)<MIN_TRAIN_ROWS:
+# ================= BUCKETING =================
+def bucket_age(m):
+    if m < 15: return "<15m"
+    if m < 60: return "15-60m"
+    if m < 360: return "1-6h"
+    return ">6h"
+
+def bucket_liq(x):
+    if x < 5: return "<5%"
+    if x < 15: return "5-15%"
+    if x < 30: return "15-30%"
+    return ">30%"
+
+def bucket_ratio(x):
+    if x < 0.7: return "<0.7"
+    if x < 1.2: return "0.7-1.2"
+    if x < 2: return "1.2-2"
+    return ">2"
+
+# ================= ORACLE CORE =================
+def oracle_stats(df, row):
+    if len(df) < 20:
         return None
-    df["is_survivor"]=~df["label_outcome"].str.contains("RUG")
-    X=df[["liq_to_mc","buy_sell_ratio","volume_5m","volume_1h","age_minutes"]]
-    y=df["is_survivor"]
-    m=RandomForestClassifier(n_estimators=250,max_depth=8)
-    m.fit(X,y)
-    return m
 
-def survivor_prob(m,row):
-    if m is None:
-        return 0
-    X=[[row["liq_to_mc"],row["buy_sell_ratio"],
-        row["volume_5m"],row["volume_1h"],row["age_minutes"]]]
-    return int(m.predict_proba(X)[0][1]*100)
+    df2 = df.copy()
+    df2["age_b"] = df2["age_minutes"].apply(bucket_age)
+    df2["liq_b"] = df2["liq_to_mc"].apply(bucket_liq)
+    df2["ratio_b"] = df2["buy_sell_ratio"].apply(bucket_ratio)
 
-def train_upside(df,q):
-    df=df[df["label_outcome"].notna() & ~df["label_outcome"].str.contains("RUG")]
-    if len(df)<MIN_TRAIN_ROWS:
+    mask = (
+        (df2["age_b"] == bucket_age(row["age_minutes"])) &
+        (df2["liq_b"] == bucket_liq(row["liq_to_mc"])) &
+        (df2["ratio_b"] == bucket_ratio(row["buy_sell_ratio"]))
+    )
+
+    sample = df2[mask]
+    if len(sample) < 5:
         return None
-    X=df[["liq_to_mc","buy_sell_ratio","volume_5m","volume_1h","age_minutes"]]
-    y=df["mc_after_3d"]/df["market_cap"]
-    m=GradientBoostingRegressor(loss="quantile",alpha=q,n_estimators=150)
-    m.fit(X,y)
-    return m
 
-def upside_predict(m,row):
-    if m is None:
-        return 0
-    X=[[row["liq_to_mc"],row["buy_sell_ratio"],
-        row["volume_5m"],row["volume_1h"],row["age_minutes"]]]
-    return int((m.predict(X)[0]-1)*100)
+    non_rug = sample[~sample["label_outcome"].fillna("").str.contains("RUG")]
+    surv = int(len(non_rug) / len(sample) * 100)
 
-def rank_score(surv,mid,up,conf):
-    return min(100,int(0.4*surv + 0.3*max(mid,0) + 0.2*max(up,0)/2 + 0.1*conf))
+    upside = None
+    if len(non_rug) >= 3:
+        mult = non_rug["mc_after_3d"] / non_rug["market_cap"]
+        upside = {
+            "median": round(mult.median(),2),
+            "p80": round(mult.quantile(0.8),2),
+            "max": round(mult.max(),2)
+        }
+
+    rarity = int((1 - len(sample)/max(len(df2),1)) * 100)
+
+    score = int(
+        0.45 * surv +
+        0.30 * (upside["median"]*10 if upside else 0) +
+        0.15 * rarity +
+        0.10 * min(row["buy_sell_ratio"]*20,100)
+    )
+    score = max(0,min(100,score))
+
+    return surv, upside, rarity, score
 
 # ================= AUTO LABEL =================
 def auto_label(df):
@@ -147,11 +169,6 @@ def index():
     scanned=len(df)
     labeled=df["label_outcome"].notna().sum()
 
-    surv_model=train_survivor(df)
-    q10=train_upside(df,0.1)
-    q50=train_upside(df,0.5)
-    q90=train_upside(df,0.9)
-
     results=[]
 
     if request.method=="POST":
@@ -183,28 +200,28 @@ def index():
 
             df=pd.concat([df,pd.DataFrame([row])],ignore_index=True)
 
-            surv=survivor_prob(surv_model,row)
-            mid=upside_predict(q50,row) if surv>=50 else None
-            up=upside_predict(q90,row) if surv>=50 else None
-            down=upside_predict(q10,row) if surv>=50 else None
-
-            score=rank_score(surv,mid or 0,up or 0,0)
+            stats = oracle_stats(df, row)
+            if stats:
+                surv, up, rarity, score = stats
+            else:
+                surv, up, rarity, score = 0, None, 0, 0
 
             results.append({
                 "symbol":d["symbol"],
                 "mc":int(d["mc"]),
                 "liq":int(d["liq"]),
                 "surv":surv,
-                "down":down,
-                "mid":mid,
-                "up":up,
-                "rank":score
+                "median": up["median"] if up else "-",
+                "p80": up["p80"] if up else "-",
+                "max": up["max"] if up else "-",
+                "rarity":rarity,
+                "score":score
             })
 
         save_csv(df,sha)
 
     html="""
-    <h2 style="font-size:42px;">📊 ABC Meme Oracle</h2>
+    <h2 style="font-size:42px;">🧠 Lightweight Meme Oracle</h2>
     <p style="font-size:26px;">Scanned: {{scanned}} | Labeled: {{labeled}}</p>
 
     <form method="post">
@@ -216,25 +233,20 @@ def index():
       <button style="font-size:20px;padding:10px;">🧠 Auto Label</button>
     </form>
 
-    <form method="get" action="/backtest">
-      <button style="font-size:20px;padding:10px;">📊 Backtest</button>
-    </form>
-
-    <table border="1" cellpadding="18" style="font-size:48px;margin-top:20px;">
+    <table border="1" cellpadding="18" style="font-size:44px;margin-top:20px;">
       <tr>
         <th>Coin</th><th>MC</th><th>Liq</th>
-        <th>Survivor%</th>
-        <th>Down%</th><th>Mid%</th><th>Up%</th>
-        <th>Rank</th>
+        <th>Surv%</th>
+        <th>Median×</th><th>80%×</th><th>Max×</th>
+        <th>Rarity</th><th>Oracle</th>
       </tr>
       {% for r in results %}
       <tr>
         <td>{{r.symbol}}</td><td>${{r.mc}}</td><td>${{r.liq}}</td>
         <td>{{r.surv}}</td>
-        <td>{{r.down if r.down is not none else "-"}}</td>
-        <td>{{r.mid if r.mid is not none else "-"}}</td>
-        <td>{{r.up if r.up is not none else "-"}}</td>
-        <td>{{r.rank}}</td>
+        <td>{{r.median}}</td><td>{{r.p80}}</td><td>{{r.max}}</td>
+        <td>{{r.rarity}}</td>
+        <td>{{r.score}}</td>
       </tr>
       {% endfor %}
     </table>
@@ -247,15 +259,6 @@ def label():
     df,checked,labeled=auto_label(df)
     save_csv(df,sha)
     return f"Labeled {labeled} of {checked} checked<br><a href='/'>Back</a>"
-
-@app.route("/backtest")
-def backtest():
-    df,_=load_csv()
-    bt=df.dropna(subset=["mc_after_3d"])
-    if len(bt)<10:
-        return "Not enough data"
-    corr,_=spearmanr(bt["market_cap"],bt["mc_after_3d"])
-    return f"Samples: {len(bt)} | Correlation: {round(corr,3)}<br><a href='/'>Back</a>"
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
